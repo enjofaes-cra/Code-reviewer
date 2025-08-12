@@ -1,333 +1,216 @@
-Master, understood. Here is a single linear R script, no functions and no main, that you can run top to bottom. It reads predictions, merges with actuals, computes global metrics, calibration by decile, PSI if a reference is provided, a segment report with a progress bar, and saves CSV and PNG outputs.
+import os
+import json
+import logging
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import matplotlib.pyplot as plt
 
-File: ModelComponents/monitoring_all_in_one_linear.R
+# -------------------------------------------------
+# CONFIGURATION (edit as needed)
+# -------------------------------------------------
+pred_path       = r"\\uknasdata08\FSSHARED\WIP\Credit Risk Assurance\Engagements\XXXXX\YE25\4. Data and Codes\ECL Engine Code\MNF\Recoded_Hitesh\Output\7a\Base_Values_EAD.csv"
+actuals_path    = r"\\uknasdata08\FSSHARED\WIP\Credit Risk Assurance\Engagements\XXXXX\YE25\4. Data and Codes\ECL Engine Code\MNF\Recoded_Hitesh\Actuals\actuals.csv"
+out_dir         = r"\\uknasdata08\FSSHARED\WIP\Credit Risk Assurance\Engagements\XXXXX\YE25\4. Data and Codes\ECL Engine Code\MNF\Recoded_Hitesh\Monitoring\2025-08-12"
 
-# ModelComponents/monitoring_all_in_one_linear.R
+key_col         = "account_id"
+pred_ead12_col  = "EAD_12m"
+pred_eadlt_col  = "EAD_LT"
+act_ead12_col   = "Actual_EAD_12m"
+act_eadlt_col   = "Actual_EAD_LT"
+segments_str    = "Portfolio,Term_Bucket,TOB_Bucket"   # "" if none
+score_ref_path  = None                                 # optional
+score_col       = None                                 # optional
 
-# ============================================
-# [0] Libraries and parameters
-# ============================================
-suppressWarnings({
-  if (!requireNamespace("data.table", quietly = TRUE)) install.packages("data.table")
-  if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
-  if (!requireNamespace("progress", quietly = TRUE)) install.packages("progress")
-  if (!requireNamespace("jsonlite", quietly = TRUE)) install.packages("jsonlite")
-})
+# -------------------------------------------------
+# SETUP
+# -------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-library(data.table)
-library(ggplot2)
-library(progress)
-library(jsonlite)
+if not os.path.exists(out_dir):
+    os.makedirs(out_dir)
 
-# Configure inputs, edit these paths or pass them via environment variables if preferred
-pred_path       <- "\\\\uknasdata08\\FSSHARED\\WIP\\Credit Risk Assurance\\Engagements\\XXXXX\\YE25\\4. Data and Codes\\ECL Engine Code\\MNF\\Recoded_Hitesh\\Output\\7a\\Base_Values_EAD.csv"
-actuals_path    <- "\\\\uknasdata08\\FSSHARED\\WIP\\Credit Risk Assurance\\Engagements\\XXXXX\\YE25\\4. Data and Codes\\ECL Engine Code\\MNF\\Recoded_Hitesh\\Actuals\\actuals.csv"
-out_dir         <- "\\\\uknasdata08\\FSSHARED\\WIP\\Credit Risk Assurance\\Engagements\\XXXXX\\YE25\\4. Data and Codes\\ECL Engine Code\\MNF\\Recoded_Hitesh\\Monitoring\\2025-08-12"
-key_col         <- "account_id"
-pred_ead12_col  <- "EAD_12m"
-pred_eadlt_col  <- "EAD_LT"
-act_ead12_col   <- "Actual_EAD_12m"
-act_eadlt_col   <- "Actual_EAD_LT"
-segments_raw    <- "Portfolio,Term_Bucket,TOB_Bucket"   # comma separated list, can be ""
-score_ref_path  <- NULL                                 # optional, like "\\\\...\\training_scores.csv"
-score_col       <- NULL                                 # optional, like "model_score"
-log_level       <- "INFO"                               # "INFO" or "DEBUG"
+logging.info("Reading data")
+df_pred = pd.read_csv(pred_path)
+df_act = pd.read_csv(actuals_path)
 
-# ============================================
-# [1] Simple logger
-# ============================================
-log_threshold <- toupper(log_level)
-log_order <- c("DEBUG" = 1, "INFO" = 2, "WARN" = 3, "ERROR" = 4)
-log_enabled <- function(level) log_order[toupper(level)] >= log_order[log_threshold]
-log_msg <- function(level, ...) {
-  if (log_enabled(level)) {
-    cat(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "|", toupper(level), "|", paste0(..., collapse = ""), "\n")
-  }
+# Check required columns
+for col in [key_col, pred_ead12_col, pred_eadlt_col]:
+    if col not in df_pred.columns:
+        raise ValueError(f"Missing {col} in predictions")
+for col in [key_col, act_ead12_col, act_eadlt_col]:
+    if col not in df_act.columns:
+        raise ValueError(f"Missing {col} in actuals")
+
+# Merge
+df = df_pred.merge(df_act, on=key_col, how="inner", suffixes=("", "_act"))
+if df.empty:
+    logging.warning("Merged dataframe is empty")
+
+# -------------------------------------------------
+# GLOBAL METRICS
+# -------------------------------------------------
+def metrics(y, p):
+    y = np.asarray(y, dtype=float)
+    p = np.asarray(p, dtype=float)
+    diff = p - y
+    rmse = np.sqrt(np.nanmean(diff ** 2))
+    mae = np.nanmean(np.abs(diff))
+    mape = np.nanmean(np.abs(diff) / np.where(y == 0, np.nan, np.abs(y))) * 100
+    ss_res = np.nansum(diff ** 2)
+    ss_tot = np.nansum((y - np.nanmean(y)) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    return rmse, mae, mape, r2
+
+rows = []
+for pred_col, act_col, label in [
+    (pred_ead12_col, act_ead12_col, "EAD_12m"),
+    (pred_eadlt_col, act_eadlt_col, "EAD_LT")
+]:
+    rmse, mae, mape, r2 = metrics(df[act_col], df[pred_col])
+    rows.append({
+        "target": label,
+        "RMSE": rmse, "MAE": mae, "MAPE": mape, "R2": r2,
+        "n": len(df),
+        "actual_sum": df[act_col].sum(skipna=True),
+        "pred_sum": df[pred_col].sum(skipna=True),
+        "bias_sum": df[pred_col].sum(skipna=True) - df[act_col].sum(skipna=True)
+    })
+global_metrics = pd.DataFrame(rows)
+global_metrics.to_csv(os.path.join(out_dir, "global_metrics.csv"), index=False)
+
+# -------------------------------------------------
+# CALIBRATION TABLES + PLOTS
+# -------------------------------------------------
+def decile_table(df, pred_col, act_col, n=10):
+    rank = df[pred_col].rank(method="first", na_option="keep")
+    deciles = pd.qcut(rank, q=n, labels=False, duplicates="drop") + 1
+    tmp = df.assign(decile=deciles)
+    out = tmp.groupby("decile", dropna=False).agg(
+        count=(pred_col, "size"),
+        pred_mean=(pred_col, "mean"),
+        actual_mean=(act_col, "mean"),
+        pred_sum=(pred_col, "sum"),
+        actual_sum=(act_col, "sum"),
+    ).reset_index()
+    out["bias_sum"] = out["pred_sum"] - out["actual_sum"]
+    out["bias_pct"] = np.where(out["actual_sum"] == 0, np.nan, out["bias_sum"] / out["actual_sum"]) * 100
+    return out
+
+def plot_calibration(df_dec, title, path):
+    plt.figure()
+    plt.plot(df_dec["decile"], df_dec["pred_mean"], marker="o", label="Pred mean")
+    plt.plot(df_dec["decile"], df_dec["actual_mean"], marker="o", label="Actual mean")
+    plt.xlabel("Decile")
+    plt.ylabel("Mean value")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+def plot_bias(df_dec, title, path):
+    plt.figure()
+    plt.bar(df_dec["decile"], df_dec["bias_sum"])
+    plt.xlabel("Decile")
+    plt.ylabel("Pred - Actual sum")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+for pred_col, act_col, label in [
+    (pred_ead12_col, act_ead12_col, "EAD_12m"),
+    (pred_eadlt_col, act_eadlt_col, "EAD_LT")
+]:
+    dec = decile_table(df, pred_col, act_col)
+    dec.to_csv(os.path.join(out_dir, f"calibration_{label}.csv"), index=False)
+    plot_calibration(dec, f"Calibration {label}", os.path.join(out_dir, f"calibration_curve_{label}.png"))
+    plot_bias(dec, f"Bias by decile {label}", os.path.join(out_dir, f"bias_by_decile_{label}.png"))
+
+# -------------------------------------------------
+# SEGMENT REPORT
+# -------------------------------------------------
+segments = [s.strip() for s in segments_str.split(",") if s.strip()]
+seg_cols = [c for c in segments if c in df.columns]
+rows = []
+
+if not seg_cols:
+    groups = [("", df)]
+else:
+    groups = list(df.groupby(seg_cols, dropna=False))
+
+for seg_key, g in tqdm(groups, desc="Segments"):
+    for pred_col, act_col in [
+        (pred_ead12_col, act_ead12_col),
+        (pred_eadlt_col, act_eadlt_col)
+    ]:
+        rmse, mae, mape, r2 = metrics(g[act_col], g[pred_col])
+        entry = {}
+        if seg_cols:
+            if isinstance(seg_key, tuple):
+                for c, v in zip(seg_cols, seg_key):
+                    entry[c] = v
+            else:
+                entry[seg_cols[0]] = seg_key
+        entry.update({
+            "pred_col": pred_col,
+            "actual_col": act_col,
+            "RMSE": rmse, "MAE": mae, "MAPE": mape, "R2": r2,
+            "n": len(g),
+            "actual_sum": g[act_col].sum(skipna=True),
+            "pred_sum": g[pred_col].sum(skipna=True),
+            "bias_sum": g[pred_col].sum(skipna=True) - g[act_col].sum(skipna=True)
+        })
+        rows.append(entry)
+
+seg_report = pd.DataFrame(rows)
+seg_report.to_csv(os.path.join(out_dir, "segment_report.csv"), index=False)
+
+# -------------------------------------------------
+# PSI (optional)
+# -------------------------------------------------
+psi_path = None
+if score_ref_path and score_col and os.path.exists(score_ref_path) and score_col in df.columns:
+    df_ref = pd.read_csv(score_ref_path)
+    if score_col in df_ref.columns:
+        train_scores = np.asarray(df_ref[score_col], dtype=float)
+        monitor_scores = np.asarray(df[score_col], dtype=float)
+        qs = np.nanquantile(train_scores, np.linspace(0, 1, 11))
+        qs[0], qs[-1] = -np.inf, np.inf
+        def bins(x):
+            cats = pd.cut(x, bins=qs, include_lowest=True)
+            vc = cats.value_counts(normalize=True, sort=False)
+            return vc.reindex(pd.IntervalIndex.from_breaks(qs), fill_value=0.0).values
+        psi_val = float(np.sum((bins(monitor_scores) - bins(train_scores)) *
+                               np.log(bins(monitor_scores) / bins(train_scores))))
+        psi_path = os.path.join(out_dir, "psi.json")
+        with open(psi_path, "w") as f:
+            json.dump({"score_col": score_col, "PSI": psi_val}, f, indent=2)
+
+# -------------------------------------------------
+# INDEX MANIFEST
+# -------------------------------------------------
+index = {
+    "global_metrics_csv": os.path.join(out_dir, "global_metrics.csv"),
+    "calibration": {
+        "EAD_12m": {
+            "table": os.path.join(out_dir, "calibration_EAD_12m.csv"),
+            "curve_png": os.path.join(out_dir, "calibration_curve_EAD_12m.png"),
+            "bias_png": os.path.join(out_dir, "bias_by_decile_EAD_12m.png"),
+        },
+        "EAD_LT": {
+            "table": os.path.join(out_dir, "calibration_EAD_LT.csv"),
+            "curve_png": os.path.join(out_dir, "calibration_curve_EAD_LT.png"),
+            "bias_png": os.path.join(out_dir, "bias_by_decile_EAD_LT.png"),
+        }
+    },
+    "segment_report_csv": os.path.join(out_dir, "segment_report.csv"),
+    "psi_json": psi_path
 }
 
-# ============================================
-# [2] IO setup
-# ============================================
-if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-if (!file.exists(pred_path)) stop(sprintf("Predictions file not found at %s", pred_path))
-if (!file.exists(actuals_path)) stop(sprintf("Actuals file not found at %s", actuals_path))
+with open(os.path.join(out_dir, "index.json"), "w") as f:
+    json.dump(index, f, indent=2)
 
-log_msg("INFO", "Reading predictions and actuals")
-dt_pred <- data.table::fread(pred_path)
-dt_act  <- data.table::fread(actuals_path)
-
-# Validate required columns
-required_pred <- c(key_col, pred_ead12_col, pred_eadlt_col)
-required_act  <- c(key_col, act_ead12_col, act_eadlt_col)
-missing_pred <- setdiff(required_pred, names(dt_pred))
-missing_act  <- setdiff(required_act,  names(dt_act))
-if (length(missing_pred) > 0) stop(sprintf("Predictions missing required columns: %s", paste(missing_pred, collapse = ", ")))
-if (length(missing_act)  > 0) stop(sprintf("Actuals missing required columns: %s", paste(missing_act,  collapse = ", ")))
-
-# ============================================
-# [3] Merge predictions and actuals
-# ============================================
-log_msg("INFO", "Merging by key")
-setDT(dt_pred); setDT(dt_act)
-dt <- merge(dt_pred, dt_act, by = key_col, suffixes = c("", "_act"))
-if (nrow(dt) == 0L) log_msg("WARN", "Merged data is empty after join")
-if (any(duplicated(dt[[key_col]]))) log_msg("WARN", "Duplicated keys after merge")
-
-# ============================================
-# [4] Global metrics for EAD_12m and EAD_LT
-# ============================================
-log_msg("INFO", "Computing global metrics")
-y12  <- as.numeric(dt[[act_ead12_col]])
-p12  <- as.numeric(dt[[pred_ead12_col]])
-diff12 <- p12 - y12
-rmse12 <- sqrt(mean(diff12^2, na.rm = TRUE))
-mae12  <- mean(abs(diff12), na.rm = TRUE)
-mape12 <- mean(abs(diff12) / ifelse(y12 == 0, NA_real_, abs(y12)), na.rm = TRUE) * 100
-ss_res12 <- sum(diff12^2, na.rm = TRUE)
-ss_tot12 <- sum((y12 - mean(y12, na.rm = TRUE))^2, na.rm = TRUE)
-r2_12 <- if (ss_tot12 > 0) 1 - ss_res12 / ss_tot12 else NA_real_
-
-yLT  <- as.numeric(dt[[act_eadlt_col]])
-pLT  <- as.numeric(dt[[pred_eadlt_col]])
-diffLT <- pLT - yLT
-rmseLT <- sqrt(mean(diffLT^2, na.rm = TRUE))
-maeLT  <- mean(abs(diffLT), na.rm = TRUE)
-mapeLT <- mean(abs(diffLT) / ifelse(yLT == 0, NA_real_, abs(yLT)), na.rm = TRUE) * 100
-ss_resLT <- sum(diffLT^2, na.rm = TRUE)
-ss_totLT <- sum((yLT - mean(yLT, na.rm = TRUE))^2, na.rm = TRUE)
-r2_LT <- if (ss_totLT > 0) 1 - ss_resLT / ss_totLT else NA_real_
-
-global_metrics <- data.table(
-  target = c("EAD_12m", "EAD_LT"),
-  RMSE   = c(rmse12, rmseLT),
-  MAE    = c(mae12, maeLT),
-  MAPE   = c(mape12, mapeLT),
-  R2     = c(r2_12, r2_LT),
-  n      = c(nrow(dt), nrow(dt)),
-  actual_sum = c(sum(y12, na.rm = TRUE), sum(yLT, na.rm = TRUE)),
-  pred_sum   = c(sum(p12, na.rm = TRUE), sum(pLT, na.rm = TRUE)),
-  bias_sum   = c(sum(p12, na.rm = TRUE) - sum(y12, na.rm = TRUE),
-                 sum(pLT, na.rm = TRUE) - sum(yLT, na.rm = TRUE))
-)
-fwrite(global_metrics, file.path(out_dir, "global_metrics.csv"))
-
-# ============================================
-# [5] Calibration by decile, tables and plots
-# ============================================
-log_msg("INFO", "Building calibration by decile")
-
-# Helper, build deciles from prediction rank
-build_deciles <- function(pred_vec, n_bins = 10L) {
-  r <- rank(pred_vec, ties.method = "first", na.last = "keep")
-  qs <- quantile(r, probs = seq(0, 1, length.out = n_bins + 1), na.rm = TRUE, type = 7)
-  cut(r, breaks = qs, include.lowest = TRUE, labels = FALSE)
-}
-
-# 12m
-dec12 <- build_deciles(dt[[pred_ead12_col]], n_bins = 10L)
-cal12 <- dt[, .(
-  count = .N,
-  pred_mean = mean(get(pred_ead12_col), na.rm = TRUE),
-  actual_mean = mean(get(act_ead12_col), na.rm = TRUE),
-  pred_sum = sum(get(pred_ead12_col), na.rm = TRUE),
-  actual_sum = sum(get(act_ead12_col), na.rm = TRUE)
-), by = .(decile = dec12)][order(decile)]
-cal12[, bias_sum := pred_sum - actual_sum]
-cal12[, bias_pct := ifelse(actual_sum == 0, NA_real_, (bias_sum / actual_sum) * 100)]
-fwrite(cal12, file.path(out_dir, "calibration_EAD_12m.csv"))
-
-p_cal12 <- ggplot(cal12, aes(x = decile)) +
-  geom_line(aes(y = pred_mean)) +
-  geom_point(aes(y = pred_mean)) +
-  geom_line(aes(y = actual_mean)) +
-  geom_point(aes(y = actual_mean)) +
-  labs(x = "Prediction decile", y = "Mean value", title = "Calibration by decile, EAD_12m")
-ggsave(file.path(out_dir, "calibration_curve_EAD_12m.png"), plot = p_cal12, width = 7, height = 4.5, dpi = 120)
-
-p_bias12 <- ggplot(cal12, aes(x = factor(decile), y = bias_sum)) +
-  geom_col() +
-  labs(x = "Prediction decile", y = "Predicted minus Actual, sum", title = "Sum bias by decile, EAD_12m")
-ggsave(file.path(out_dir, "bias_by_decile_EAD_12m.png"), plot = p_bias12, width = 7, height = 4.5, dpi = 120)
-
-# Lifetime
-decLT <- build_deciles(dt[[pred_eadlt_col]], n_bins = 10L)
-calLT <- dt[, .(
-  count = .N,
-  pred_mean = mean(get(pred_eadlt_col), na.rm = TRUE),
-  actual_mean = mean(get(act_eadlt_col), na.rm = TRUE),
-  pred_sum = sum(get(pred_eadlt_col), na.rm = TRUE),
-  actual_sum = sum(get(act_eadlt_col), na.rm = TRUE)
-), by = .(decile = decLT)][order(decile)]
-calLT[, bias_sum := pred_sum - actual_sum]
-calLT[, bias_pct := ifelse(actual_sum == 0, NA_real_, (bias_sum / actual_sum) * 100)]
-fwrite(calLT, file.path(out_dir, "calibration_EAD_LT.csv"))
-
-p_calLT <- ggplot(calLT, aes(x = decile)) +
-  geom_line(aes(y = pred_mean)) +
-  geom_point(aes(y = pred_mean)) +
-  geom_line(aes(y = actual_mean)) +
-  geom_point(aes(y = actual_mean)) +
-  labs(x = "Prediction decile", y = "Mean value", title = "Calibration by decile, EAD_LT")
-ggsave(file.path(out_dir, "calibration_curve_EAD_LT.png"), plot = p_calLT, width = 7, height = 4.5, dpi = 120)
-
-p_biasLT <- ggplot(calLT, aes(x = factor(decile), y = bias_sum)) +
-  geom_col() +
-  labs(x = "Prediction decile", y = "Predicted minus Actual, sum", title = "Sum bias by decile, EAD_LT")
-ggsave(file.path(out_dir, "bias_by_decile_EAD_LT.png"), plot = p_biasLT, width = 7, height = 4.5, dpi = 120)
-
-# ============================================
-# [6] PSI, optional if score reference provided
-# ============================================
-psi_json_path <- NULL
-if (!is.null(score_ref_path) && !is.null(score_col) &&
-    nchar(score_ref_path) > 0 && nchar(score_col) > 0 &&
-    file.exists(score_ref_path) && score_col %in% names(dt)) {
-
-  log_msg("INFO", "Computing PSI for score column")
-  dt_ref <- fread(score_ref_path)
-  if (score_col %in% names(dt_ref)) {
-    train_scores   <- as.numeric(dt_ref[[score_col]])
-    monitor_scores <- as.numeric(dt[[score_col]])
-    qs <- stats::quantile(train_scores, probs = seq(0, 1, length.out = 11), na.rm = TRUE, type = 7)
-    qs[1] <- -Inf; qs[length(qs)] <- Inf
-    cut_train   <- cut(train_scores, breaks = qs, include.lowest = TRUE)
-    cut_monitor <- cut(monitor_scores, breaks = qs, include.lowest = TRUE)
-    e <- prop.table(table(cut_train))
-    a <- prop.table(table(cut_monitor))
-    all_levels <- union(levels(cut_train), levels(cut_monitor))
-    e <- e[all_levels]; e[is.na(e)] <- 0
-    a <- a[all_levels]; a[is.na(a)] <- 0
-    expected <- as.numeric(e); expected[expected <= 0] <- 1e-8
-    actual   <- as.numeric(a); actual[actual <= 0] <- 1e-8
-    psi_val <- sum((actual - expected) * log(actual / expected))
-    psi_json_path <- file.path(out_dir, "psi.json")
-    writeLines(jsonlite::toJSON(list(score_col = score_col, PSI = unname(psi_val)), pretty = TRUE, auto_unbox = TRUE),
-               con = psi_json_path)
-  } else {
-    log_msg("WARN", "Score column not found in reference file, PSI skipped")
-  }
-} else {
-  log_msg("INFO", "PSI inputs not provided, skipping PSI")
-}
-
-# ============================================
-# [7] Segment level report with progress bar
-# ============================================
-log_msg("INFO", "Building segment level report")
-segs <- if (nchar(segments_raw) > 0) trimws(unlist(strsplit(segments_raw, ","))) else character(0)
-seg_cols <- segs[segs %in% names(dt)]
-segment_report_path <- file.path(out_dir, "segment_report.csv")
-
-if (length(seg_cols) == 0L) {
-  # No segments, compute once
-  mets_rows <- list()
-  # Pair 1
-  dsub <- dt
-  y <- dsub[[act_ead12_col]]; p <- dsub[[pred_ead12_col]]
-  d <- as.numeric(p) - as.numeric(y)
-  rmse <- sqrt(mean(d^2, na.rm = TRUE))
-  mae  <- mean(abs(d), na.rm = TRUE)
-  mape <- mean(abs(d) / ifelse(as.numeric(y) == 0, NA_real_, abs(as.numeric(y))), na.rm = TRUE) * 100
-  ss_res <- sum(d^2, na.rm = TRUE); ss_tot <- sum((as.numeric(y) - mean(as.numeric(y), na.rm = TRUE))^2, na.rm = TRUE)
-  r2 <- if (ss_tot > 0) 1 - ss_res / ss_tot else NA_real_
-  mets_rows[[length(mets_rows) + 1L]] <- data.table(
-    pred_col = pred_ead12_col, actual_col = act_ead12_col, RMSE = rmse, MAE = mae, MAPE = mape, R2 = r2,
-    n = nrow(dsub), actual_sum = sum(as.numeric(y), na.rm = TRUE), pred_sum = sum(as.numeric(p), na.rm = TRUE),
-    bias_sum = sum(as.numeric(p), na.rm = TRUE) - sum(as.numeric(y), na.rm = TRUE)
-  )
-  # Pair 2
-  y <- dsub[[act_eadlt_col]]; p <- dsub[[pred_eadlt_col]]
-  d <- as.numeric(p) - as.numeric(y)
-  rmse <- sqrt(mean(d^2, na.rm = TRUE))
-  mae  <- mean(abs(d), na.rm = TRUE)
-  mape <- mean(abs(d) / ifelse(as.numeric(y) == 0, NA_real_, abs(as.numeric(y))), na.rm = TRUE) * 100
-  ss_res <- sum(d^2, na.rm = TRUE); ss_tot <- sum((as.numeric(y) - mean(as.numeric(y), na.rm = TRUE))^2, na.rm = TRUE)
-  r2 <- if (ss_tot > 0) 1 - ss_res / ss_tot else NA_real_
-  mets_rows[[length(mets_rows) + 1L]] <- data.table(
-    pred_col = pred_eadlt_col, actual_col = act_eadlt_col, RMSE = rmse, MAE = mae, MAPE = mape, R2 = r2,
-    n = nrow(dsub), actual_sum = sum(as.numeric(y), na.rm = TRUE), pred_sum = sum(as.numeric(p), na.rm = TRUE),
-    bias_sum = sum(as.numeric(p), na.rm = TRUE) - sum(as.numeric(y), na.rm = TRUE)
-  )
-  fwrite(rbindlist(mets_rows, fill = TRUE), segment_report_path)
-} else {
-  # With segments, expand grid of unique keys, iterate with a progress bar
-  key_table <- unique(dt[, ..seg_cols])
-  pb <- progress_bar$new(
-    format = "Segments [:bar] :current/:total elapsed :elapsed eta :eta",
-    total = nrow(key_table), clear = FALSE, width = 80
-  )
-  rows <- vector("list", nrow(key_table) * 2L)
-  idx <- 1L
-  for (i in seq_len(nrow(key_table))) {
-    pb$tick()
-    key_row <- key_table[i]
-    dsub <- dt[key_row, on = seg_cols, nomatch = 0L]
-    # Skip empty subsets
-    if (nrow(dsub) == 0L) next
-    # Pair 1
-    y <- dsub[[act_ead12_col]]; p <- dsub[[pred_ead12_col]]
-    d <- as.numeric(p) - as.numeric(y)
-    rmse <- sqrt(mean(d^2, na.rm = TRUE))
-    mae  <- mean(abs(d), na.rm = TRUE)
-    mape <- mean(abs(d) / ifelse(as.numeric(y) == 0, NA_real_, abs(as.numeric(y))), na.rm = TRUE) * 100
-    ss_res <- sum(d^2, na.rm = TRUE); ss_tot <- sum((as.numeric(y) - mean(as.numeric(y), na.rm = TRUE))^2, na.rm = TRUE)
-    r2 <- if (ss_tot > 0) 1 - ss_res / ss_tot else NA_real_
-    entry1 <- cbind(key_row, data.table(
-      pred_col = pred_ead12_col, actual_col = act_ead12_col, RMSE = rmse, MAE = mae, MAPE = mape, R2 = r2,
-      n = nrow(dsub), actual_sum = sum(as.numeric(y), na.rm = TRUE), pred_sum = sum(as.numeric(p), na.rm = TRUE),
-      bias_sum = sum(as.numeric(p), na.rm = TRUE) - sum(as.numeric(y), na.rm = TRUE)
-    ))
-    rows[[idx]] <- entry1; idx <- idx + 1L
-    # Pair 2
-    y <- dsub[[act_eadlt_col]]; p <- dsub[[pred_eadlt_col]]
-    d <- as.numeric(p) - as.numeric(y)
-    rmse <- sqrt(mean(d^2, na.rm = TRUE))
-    mae  <- mean(abs(d), na.rm = TRUE)
-    mape <- mean(abs(d) / ifelse(as.numeric(y) == 0, NA_real_, abs(as.numeric(y))), na.rm = TRUE) * 100
-    ss_res <- sum(d^2, na.rm = TRUE); ss_tot <- sum((as.numeric(y) - mean(as.numeric(y), na.rm = TRUE))^2, na.rm = TRUE)
-    r2 <- if (ss_tot > 0) 1 - ss_res / ss_tot else NA_real_
-    entry2 <- cbind(key_row, data.table(
-      pred_col = pred_eadlt_col, actual_col = act_eadlt_col, RMSE = rmse, MAE = mae, MAPE = mape, R2 = r2,
-      n = nrow(dsub), actual_sum = sum(as.numeric(y), na.rm = TRUE), pred_sum = sum(as.numeric(p), na.rm = TRUE),
-      bias_sum = sum(as.numeric(p), na.rm = TRUE) - sum(as.numeric(y), na.rm = TRUE)
-    ))
-    rows[[idx]] <- entry2; idx <- idx + 1L
-  }
-  fwrite(rbindlist(rows, fill = TRUE), segment_report_path)
-}
-
-# ============================================
-# [8] Index manifest
-# ============================================
-index_list <- list(
-  global_metrics_csv = file.path(out_dir, "global_metrics.csv"),
-  calibration = list(
-    EAD_12m = list(
-      table = file.path(out_dir, "calibration_EAD_12m.csv"),
-      curve_png = file.path(out_dir, "calibration_curve_EAD_12m.png"),
-      bias_png  = file.path(out_dir, "bias_by_decile_EAD_12m.png")
-    ),
-    EAD_LT = list(
-      table = file.path(out_dir, "calibration_EAD_LT.csv"),
-      curve_png = file.path(out_dir, "calibration_curve_EAD_LT.png"),
-      bias_png  = file.path(out_dir, "bias_by_decile_EAD_LT.png")
-    )
-  ),
-  segment_report_csv = segment_report_path,
-  psi_json = if (is.null(psi_json_path)) NULL else psi_json_path
-)
-writeLines(jsonlite::toJSON(index_list, pretty = TRUE, auto_unbox = TRUE), con = file.path(out_dir, "index.json"))
-log_msg("INFO", "Monitoring completed")
-
-Short section recap
-	•	[0] loads libraries and sets input parameters, including file paths and column names.
-	•	[1] defines a tiny logger for readable progress.
-	•	[2] prepares the output folder and reads CSVs.
-	•	[3] merges predictions with actuals on your key.
-	•	[4] computes global metrics for EAD 12 months and lifetime, and writes global_metrics.csv.
-	•	[5] builds decile calibration tables and two plots per target, and writes CSVs and PNGs.
-	•	[6] computes PSI for a score column when a reference distribution is provided, writes psi.json.
-	•	[7] produces a segment level report with a visible progress bar, writes segment_report.csv.
-	•	[8] writes a compact index.json that points to all outputs.
-
-If you want me to map your exact segment fields or different column names, tell me which ones to plug in, Master.
+logging.info("Monitoring completed")
+print(json.dumps(index, indent=2))
