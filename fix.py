@@ -2,157 +2,156 @@
 2) we need to look at context to define created and input vs parameter by language. to be refined. example term_plus_12
 3) SAS adding variables looped (average_ead_i) vs python not - algin instructions there.
 4) sometime it is adding data sets to variable - context to be refinde there
+Master, perfect clarification. If lineage is code-only with no input datasets loaded, we must infer everything from static code signals. Below is a refined, deterministic rule‑set and implementation plan for each of your four points that relies solely on parsing the code, not on actual data files.
 
-Master, excellent, let’s lock these down methodically. I’ll give you a crisp fix plan per point, with concrete rules and minimal code hooks you can drop into models/Data_Lineage.py so classifications and graphs stop “jumping”.
-
-⸻
-
-1) Deterministic “Created vs Intermediate” so the network stops changing
-
-Symptom: same inputs and outputs, yet notice_of_default_fee flips between Created and Intermediate.
-Root cause: the current _simple_ai_variable_extraction and downstream classification rely on LLM heuristics and order‑of‑parsing, so ties and edge cases wobble between buckets.
-
-Deterministic rule stack (applied in this exact order)
-	1.	Input if the name is a dataset column read from an external dataset and never appears on the left side of an assignment in code.
-	2.	Created if it appears on the left side of an assignment or as an alias/derived expression in a SELECT list, and either
-	•	the RHS contains any operator, function call, CASE/IF expression, or combine/concat, or
-	•	it is a direct rename of an input variable.
-	3.	Intermediate if it is Created but never written to an output dataset nor exported, nor referenced in a final SELECT/export step.
-	4.	Tie-breaker: if a name is both read and later assigned, treat as Created.
-	5.	Stability: always sort variable lists and de-duplicate using a canonical key (varname.lower(), first_definition_line).
-
-Language-specific LHS and “derived” detection
-	•	SAS: var = expression; in DATA step, PROC SQL SELECT ... AS var, IF/CASE indicates derivation.
-	•	SQL: any AS var in the SELECT list, or computed tokens in expressions.
-	•	Python (pandas): df['var'] = ... or df.assign(var=...) with non-trivial RHS.
-	•	R (dplyr/base): mutate(var = ...), $var <-, DT[, var := ...].
-
-Specific to notice_of_default_fee: it should be Created if it is calculated from fees, flags, or CASE logic. If later filtered out and not exported, it lands in Intermediate. The rule above makes that stable, determined by whether it surfaces in an output dataset.
-
-Implementation hook: add a deterministic classifier layer that runs after extraction, before visualization:
-
-# inside DataLineageAnalyzer
-def classify_variables_deterministically(self, graph, read_cols, write_cols, assigns, final_select_cols):
-    """
-    graph: internal edges (var<-sources)
-    read_cols: set of dataset columns observed in reads
-    write_cols: set of dataset columns observed in writes/exports
-    assigns: dict var -> first_assignment_line, rhs_tokens
-    final_select_cols: vars referenced in last-mile outputs
-    returns dict with keys: input_variables, created_variables, intermediate_variables, all_variables
-    """
-    # 1. Input
-    input_vars = {c for c in read_cols if c not in assigns}
-    # 2. Created
-    created_vars = set()
-    for v, meta in assigns.items():
-        rhs = meta.get("rhs", "")
-        is_derived = self._is_derived_expression(rhs)  # regex-based per language
-        if is_derived or v in graph:  # rename/alias becomes derived too
-            created_vars.add(v)
-    # 3. Intermediate
-    promoted_outputs = set(final_select_cols) | set(write_cols)
-    intermediate = {v for v in created_vars if v not in promoted_outputs}
-    # 4. Tie-breaker
-    input_vars -= created_vars
-    # 5. Canonicalize
-    return self._canonicalize_buckets(input_vars, intermediate, created_vars)
-
-This removes randomness and locks the network.
+I will keep this precise and actionable.
 
 ⸻
 
-2) “Parameter” vs “Input” by language, and the term_plus_12 case
+1) Stable “Created vs Intermediate” from code only
 
-Goal: treat configuration and function arguments as Parameters, not Inputs; then classify computed features like term_plus_12 correctly as Created.
+Signals we can extract without data
+	•	Assignments to columns/variables with first definition line and RHS text.
+	•	SAS: target = expr;, PROC SQL: ... AS target
+	•	Python: df['target'] = expr, df.assign(target=expr)
+	•	R: mutate(target = expr), DT[, target := expr], $target <- expr
+	•	SQL: SELECT expr AS target
+	•	Usages of variables in later expressions.
+	•	Sinks that imply “survives to output”: explicit writes or final selections:
+	•	SAS: DATA out; SET ...; then anything not dropped at end of step; KEEP=, DROP=, OUTPUT;
+	•	Python: to_csv, to_parquet, to_sql, return df at end of a function, or df[['col', ...]] immediately before a write
+	•	R: write.csv, fwrite, arrow::write_*, function return value
+	•	SQL: CREATE TABLE/VIEW, INSERT INTO, or the outermost SELECT list
 
-Parameter detection by language
-	•	SAS: macro variables &X and %LET X=...; or %sysfunc(...) results are Parameters.
-	•	Python: function arguments, constants defined at module scope, CONFIG = {...}, os.getenv() results are Parameters.
-	•	R: function arguments, options, constants, Sys.getenv() are Parameters.
-	•	SQL: bind variables :p_x, CTE parameters from application layer are Parameters.
+Deterministic classification (code-only)
 
-Mapping into your current UI
+Apply in this order:
+	1.	Candidate Created: any name assigned from an expression or alias in a SELECT.
+	2.	Survives / Promoted: if the variable appears in a sink (see above), mark is_promoted = True.
+	3.	Intermediate: Created and not promoted by any sink.
+	4.	Input (code-only approximation): column/variable names referenced but never assigned in this codebase.
+	•	Example: existing_balance used on RHS but nowhere on LHS is an Input.
+	5.	Tie-breaker: if a name is both read and later assigned, it is Created (not Input).
+	6.	Stability: canonical key (lower(name), first_def_line) and sort deterministically.
 
-Your manual-upload schema allows Input, Intermediate, Created, Output. To avoid breaking the UI:
-	•	Track role = Parameter internally.
-	•	Expose Parameter in the table as Variable Type = Input with a sub-role tag Parameter in a separate column (e.g., “Role”).
-	•	Keep “true Inputs” as dataset columns only.
-
-Concrete rule for term_plus_12:
-If Term is a dataset column, then term_plus_12 = Term + 12 is Created.
-If Term is a Parameter from config or macro, then term_plus_12 is also Created but sourced from a Parameter, not an Input.
-
-Implementation hook: augment extraction to produce roles = {var: 'Parameter'|'DatasetColumn'|'Temp'} and pass this into the deterministic classifier. Add a small “Role” column to the lineage table and a legend in the viz.
+Why this fixes flicker: we eliminate AI heuristics for bucket choice. Whether notice_of_default_fee is Created or Intermediate depends solely on whether we see it flow into a sink in the same codebase. If not seen, it is Intermediate, deterministically.
 
 ⸻
 
-3) SAS loop-created variables average_ead_i vs Python
+2) Distinguish Parameter vs Input from code context and language
 
-Problem: SAS often creates families via arrays and DO loops, while the Python path may create a single vector or not expand at all.
+We will not rely on datasets, we infer Parameters from code patterns. Then “Input” becomes “columns/vars used but never defined here”.
 
-Harmonised family handling
-	•	Detect looped families and model them as variable families with a template key, for example average_ead_{i}.
-	•	Expand into concrete variables only if the loop bounds are resolvable at parse time. Otherwise, keep the family as a single node with a badge family.
-	•	In visualization, show a collapsed node average_ead_{i} with an optional “expand family” toggle.
+Parameter patterns by language (static)
+	•	SAS: %LET NAME=...;, &NAME, %sysfunc(...), %include configuration values.
+Classify any &MACRO_VAR or %LET symbol as Parameter.
+	•	Python: function arguments, module constants UPPER_SNAKE, dicts like CONFIG = {...}, environment reads os.getenv, pathlib.Path(...) constants.
+Treat these as Parameter when used in expressions but never assigned from a dataframe column.
+	•	R: function arguments, options(), Sys.getenv(), top-level constants CONST <- ....
+	•	SQL: bind variables :p_term, ${TERM}, @term (server variables), CTE anchors that are literal constants.
 
-Detection hints
+Code-only rule for term_plus_12
+	•	If we find term_plus_12 assigned as Term + 12 and Term is never assigned in code and is not a Parameter, treat Term as Input and term_plus_12 as Created.
+	•	If Term is a Parameter by the patterns above, then term_plus_12 is Created sourced from a Parameter, not an Input.
+
+UI representation: keep “Variable Type” as today, but add a small Role column:
+	•	Role = DatasetColumn for Inputs, Parameter for parameters, Computed for Created/Intermediate.
+This preserves your schema and improves clarity without needing data files.
+
+⸻
+
+3) SAS looped families like average_ead_i vs Python single vector
+
+With code only, infer families from token patterns.
+
+Detect families statically
 	•	SAS:
-	•	array avg_ead{n} avg_ead1-avg_eadn;
-	•	avg_ead{i} = ...; do i=1 to n; ...; end;
-	•	Python (pandas/numpy):
-	•	for i in range(n): df[f'average_ead_{i}'] = ...
-	•	df.filter(regex='^average_ead_\\d+$') implies a family
-	•	df['average_ead'] = ... vector, not a family, keep as single var.
+	•	array avg_ead{n} avg_ead1-avg_eadn; or avg_ead{i} = ...; do i=1 to n; ...; end;
+	•	Create a family key average_ead_{i} with resolved=False if n is not a literal, or construct members if literal.
+	•	Python:
+	•	Expansion: for i in range(n): df[f'average_ead_{i}'] = ... → same family
+	•	Single vector: df['average_ead'] = ... → not a family, just one Created variable
+	•	R/data.table: DT[, paste0("average_ead_", i) := ...] in loops → family
 
-Instruction alignment: when SAS produces average_ead_1 ... _N, but Python produces one column, treat the Python one as Created singular, and the SAS set as a family. The rules make cross‑language graphs consistent and comprehensible.
+Harmonised representation
+	•	Internally store:
 
-Implementation hook: return an additional structure:
-
-families = {
-  'average_ead_{i}': {
-      'members': ['average_ead_1','average_ead_2', ...] or None,
-      'language': 'sas',
-      'resolved': True/False
-  }
+families['average_ead_{i}'] = {
+    'members': ['average_ead_1', 'average_ead_2', ...] or None,
+    'language': 'sas'|'python'|'r',
+    'resolved': bool
 }
 
-Visualizer shows a single node when resolved=False, or a collapsible cluster when True.
+
+	•	If Python does not expand and SAS does, we still show a single collapsed node in the viz when unresolved, or a cluster when we can list members. This keeps cross-language graphs consistent without reading data.
+
+Classification: all family members are Created. If a subset is written to a sink, only those members are “promoted,” the rest remain Intermediate. When unresolved, treat the family node as Created, Intermediate unless promoted.
 
 ⸻
 
-4) “Dataset added to variable” mix-ups
+4) Prevent “dataset added to variable” mix-ups, using code-only context
 
-Symptom: dataset names are being attached as if they were variables, producing noisy edges.
+We must keep dataset symbols separate from variable/column names purely through parsing.
 
-Robust dataset vs variable separation
+Maintain disjoint symbol tables
+	•	Datasets (frames/tables):
+	•	SAS: left of DATA out;, names in SET, MERGE, PROC SQL FROM, CREATE TABLE out AS
+	•	Python: variables assigned DataFrame‑like objects via pd.read_*, pd.DataFrame(...), df = df.merge(...), df = other_df[...]
+	•	R: read.csv/fread/arrow::read_* targets, DT <- data.table(...)
+	•	SQL: table names in FROM, outputs in CREATE TABLE/VIEW, INSERT INTO
+	•	Variables (columns):
+	•	LHS column assignments, SELECT aliases, mutate targets, subsetting df['col']
+	•	Parameters: from §2 rules
 
-Build and maintain three disjoint dictionaries as you parse:
-	•	Datasets read: from SET/MERGE (SAS), FROM tables (SQL), pd.read_* sources and assigned DataFrame symbols (Python), read.csv/fread (R).
-	•	Datasets written: CREATE TABLE ... AS (SQL), DATA out; set ... (SAS), to_csv/to_parquet targets (Python/R).
-	•	Variables (columns): only column selectors, LHS of column assignment, SELECT list aliases, mutate/assign columns.
+Guardrails
+	•	Do not add edges from a dataset node directly to a variable unless that variable is referenced in a SELECT/KEEP list or inside a block whose active dataset context is that dataset.
+	•	Keep a current dataset context stack: e.g., SAS DATA step sets out context, SET in; sets inbound context; Python block with df = ... sets dataset symbol for subsequent df['col'] references.
+	•	Disallow dataset names from entering the variable namespace. If a token matches a known dataset symbol and appears in a column position, treat it as a context marker not a variable.
 
-Key guards
-	•	Never create a dataset -> variable edge unless the variable is explicitly selected from that dataset or created into that dataset.
-	•	In pandas, distinguish the frame symbol (df, stg_ecl) from its columns. df is a dataset node, df['x'] is a variable node.
-	•	In SAS DATA steps, the DATA out; SET in; lines set the dataset context. Variables named in KEEP=/DROP= or implicit pass-through belong to in. Assignments inside the step create Created variables into out unless dropped.
-
-Implementation hook: maintain a current dataset context stack per language block, so columns seen within a block are mapped to the right dataset, and dataset tokens never end up in the variable bag.
+Outcome: dataset bubbles and variable boxes stay cleanly separated without needing to inspect any actual files.
 
 ⸻
 
-What I recommend you implement first
+Minimal implementation plan you can drop in next
 
-Since your pain #1 drives the flickering graph, start by inserting the deterministic classifier. It is self-contained and will stabilise everything:
-	1.	Parse → collect
-	•	read_cols, write_cols, final_select_cols, assigns[var] = {'line': n, 'rhs': '...'}
-	2.	Run classify_variables_deterministically(...) as above.
-	3.	Store role metadata to distinguish Parameters.
-	4.	Feed these stable buckets into your existing viz and table.
+A) Add a code-only symbol pass (no LLM):
+	•	Build:
+	•	assigns[var] = {'line': n, 'rhs': text, 'lang': 'sas|py|r|sql'}
+	•	reads[var] = {line_numbers...}
+	•	sinks = {'promoted_vars': set([...])} extracted from last writes/returns/SELECT lists
+	•	datasets = {'in': set(), 'out': set(), 'symbols': set([...])}
+	•	parameters = set([...]) via patterns in §2
+	•	families per §3
 
-Once that lands, add the Parameter role (#2), then family handling (#3), and finally the dataset guards (#4). Each step is incremental and does not break the UI.
+B) Deterministic classification layer (replaces wobbly AI bucket choice):
+	•	Use the 6‑step rule in §1 to produce input_variables, created_variables, intermediate_variables, all_variables, plus a roles dict mapping each name to Parameter|DatasetColumn|Computed.
 
-If you want, Master, I can provide a compact patch for DataLineageAnalyzer with:
-	•	_is_derived_expression regexes per language,
-	•	classify_variables_deterministically,
-	•	a tiny change in the visualizer to show a “Role” column and collapse families.
+C) Visualizer tweaks (tiny):
+	•	Add a Role column to the lineage table.
+	•	Render family nodes as collapsed clusters with a small “expand” control; when collapsed, show the template average_ead_{i}.
+
+D) Keep LLM usage only for natural‑language fields:
+	•	“Calculation Methodology”, “Explanation”, “Business Purpose” can still be LLM generated, but the buckets and edges must come from the deterministic pass to avoid flicker.
+
+⸻
+
+Sanity checks you can run now
+	•	Run twice on the same scripts and hash the tuple:
+
+hash((
+  sorted(input_variables),
+  sorted(created_variables),
+  sorted(intermediate_variables),
+  sorted(promoted_vars)
+))
+
+It should be identical across runs.
+
+	•	Confirm term_plus_12 sources:
+	•	If Term appears only as a token on RHS and not assigned, and not a Parameter → Input
+	•	If Term is %LET TERM=... or os.getenv("TERM") → Parameter
+	•	Confirm notice_of_default_fee status:
+	•	If referenced in a write, export, or final select → Created (promoted)
+	•	Otherwise → Intermediate
+
+If you want, Master, tell me which file defines DataLineageAnalyzer and I will provide a compact, numbered patch set for that file only, implementing the deterministic pass and the role column, without touching your UI layout.
