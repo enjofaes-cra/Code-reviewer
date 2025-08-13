@@ -144,4 +144,90 @@ Why this fixes your SAS/Python pair
 	•	Final, per-variable override (this patch) forces each lineage item’s category to the deterministic bucket from the post-pass, before merge—so Created/Intermediate can’t flip between runs, even if the AI’s JSON wobbles.
 	•	Input datasets can no longer be attached to created/intermediate vars.
 
-If anything still mislabels, share a couple of rows from lineage_table that look wrong and I’ll zero in on which regex or override to tweak.
+# Optional: pass deterministic hints if available
+category_hints = getattr(self, "_dl_static_categories", None)
+dataset_hints  = getattr(self, "_dl_datasets", None)
+
+lineage_prompt = f"""
+YOU ARE A PRECISE DATA-LINEAGE ENGINE. RETURN ONLY JSON.
+
+GOAL
+Trace the lineage for each target variable with stable categories (input|intermediate|created),
+correct dataset assignment, exact calculation, and source variables.
+
+TARGET VARIABLES
+{variables_str}
+
+CODE (ALL FILES)
+{all_code}
+
+STRICT DEFINITIONS
+- INPUT: a column that already exists in an input dataset/table/file (not created by code).
+- INTERMEDIATE: a column produced by a transformation step that does not represent the final output,
+  including looped arrays and temporary columns.
+- CREATED: a business-facing column intended to be used downstream or saved/exported.
+
+SAS RULES
+- Treat SAS %let, %global as PARAMETERS (not variables).
+- DATA step assignments (e.g., new = old * 2;) produce variables in the active dataset.
+- PROC SQL SELECT expressions create variables in the target table.
+- Variables dropped later are still variables; array-like loop outputs (name_1, name_2, …) are INTERMEDIATE unless saved as final.
+- Imports: PROC IMPORT / SET / FROM mark INPUT datasets; EXPORT / DATA final / CREATE TABLE mark OUTPUT.
+
+PYTHON RULES
+- Only treat DataFrame column ops as variables:
+  ✓ df['x'] = ...
+  ✓ df = df.assign(x=...)
+  ✗ x = 0.05 (PARAMETER, not a variable)
+- Reads (pd.read_csv/pd.read_excel) mark INPUT datasets; writes (to_csv/to_excel) mark OUTPUT.
+- Columns created and later dropped (especially loop arrays like name_1, name_2, …) are INTERMEDIATE.
+
+FAMILY PATTERN (LOOPS)
+- If a variable name matches ^([A-Za-z_][A-Za-z0-9_]*)_(\\d+)$, treat the whole group as one FAMILY (e.g., base_*).
+- Family members are INTERMEDIATE unless explicitly kept as final or exported.
+
+DATASET FIELD (MUST FOLLOW)
+- If category == "input": dataset MUST be the INPUT dataset name (e.g., file/table read).
+- If category in {"created","intermediate"}: dataset MUST be the OUTPUT dataset name if saved/exported;
+  otherwise "N/A".
+- Exactly one dataset name per variable (use "N/A" if not determinable).
+
+PARAMETERS / CONSTANTS (NOT VARIABLES)
+- Do NOT include macro variables (%let NAME=...), globals, scalars like RATE=0.05, file paths, counters (i,j,k).
+
+DETERMINISTIC HINTS (IF PROVIDED)
+{json.dumps(category_hints or {}, indent=2)}
+{json.dumps(dataset_hints or {}, indent=2)}
+
+USE HINTS STRICTLY:
+- If a name is listed under parameters: never classify it as a variable.
+- If a name appears under created/intermediate/input hints: prefer that category unless code clearly contradicts it.
+- If a member of a FAMILY is intermediate: the whole FAMILY is intermediate unless exported.
+
+OUTPUT JSON SCHEMA (ONLY THIS):
+{{
+  "lineage_results": [
+    {{
+      "variable": "variable_name",
+      "category": "input|intermediate|created",
+      "source_variables": ["source1","source2"],
+      "dataset": ["dataset_name_or_N/A"],
+      "calculation": "exact formula or logic (copy expressions if possible)",
+      "description": "plain-English explanation",
+      "business_purpose": "why this variable exists",
+      "code_location": "FileName:Line(s) if clear, else 'N/A'",
+      "detailed_steps": ["step 1","step 2","step 3"],
+      "family": "base_* if variable belongs to a loop family, else 'N/A'"
+    }}
+  ]
+}}
+
+REQUIREMENTS
+- Cover EVERY target variable—no omissions.
+- Use FAMILY for looped arrays (pattern above).
+- Respect dataset rule and categories strictly.
+- Prefer exact expressions from code for "calculation".
+- Never include parameters/macros/paths in variables.
+
+RETURN ONLY THE JSON. NO EXTRA TEXT.
+"""
