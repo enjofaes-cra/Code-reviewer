@@ -131,91 +131,85 @@ class DataLineageAnalyzer(AVAAssistant):
                 self.functions_macros_map[pattern_name] = matches
     
     def _simple_ai_variable_extraction(self, code_files: list) -> Dict[str, Any]:
-        """AI-powered variable extraction with parallel processing"""
-        
-        # Step 1: Compile code in logical order
+        # NOTE CHANGE1 : POINT1 "1) running the same code give same inputs and outupts, but created vs intermediate is changing --> therefore network changing:: context to be refined here. 
+        # example notice_of_default_fee"
+        """AI-powered variable extraction with a deterministic, language-aware post-pass.
+        Keeps your parallel AI discovery intact, then normalises:
+        - bans dataset-like tokens from variable lists,
+        - separates parameters/macros/scalars from real columns,
+        - groups SAS loop families (e.g., foo_1..N → foo_*),
+        - sorts for stable output so Created/Intermediate don’t flip between runs.
+        """
+        # (1.1) compile and map functions/macros
         st.write("📋 **Compiling code in logical order...**")
         self._compile_code_in_logical_order(code_files)
-        
-        # Step 2: Extract functions/macros for context
         st.write("🔧 **Extracting functions and macros...**")
         self._extract_functions_and_macros()
-        
-        # Step 3: Parallel AI variable discovery
+
+        # (1.2) NEW: pre-extract datasets once to help cleaning (still using your method)
+        st.write("📦 **Pre-extracting datasets (to stabilise variable cleaning)...**")
+        pre_input_ds, pre_output_ds = self._ai_extract_datasets(code_files)
+        ds_ban = set(pre_input_ds) | set(pre_output_ds)
+
+        # (1.3) run parallel AI batches (kept intact)
         st.write("🤖 **AI discovering variables in parallel batches...**")
-        
         progress_bar = st.progress(0)
         status_text = st.empty()
-        
-        # Process batches in parallel 
-        all_variables = {
+
+        all_ai = {
             'input_variables': [],
             'created_variables': [],
             'intermediate_variables': [],
             'all_variables': []
         }
-        
+
         def process_single_batch(batch_info):
-            """Process a single batch for variable discovery """
-            
+            """[1.3.1] prompt + call; returns 3 lists"""
             batch_id = batch_info['batch_id']
             content = batch_info['content']
-            
-            # Include function context
             function_context = ""
             if self.functions_macros_map:
                 function_context = f"\n\nFUNCTIONS/MACROS AVAILABLE: {json.dumps(self.functions_macros_map)}"
-            
-            # Ultra-strict prompt for variable discovery
+
             prompt = f"""ANALYZE CODE BATCH {batch_id} FOR VARIABLE/COLUMN NAMES. RESPOND ONLY WITH JSON.
 
-CODE BATCH:
-{content}{function_context}
+    CODE BATCH:
+    {content}{function_context}
 
-FIND VARIABLES/COLUMN NAMES FROM THE CODE BATCH BY CATEGORY. 
-CRITICAL: ONLY IDENTIFY DATA COLUMNS AS VARIABLES
+    FIND VARIABLES/COLUMN NAMES FROM THE CODE BATCH BY CATEGORY. 
+    CRITICAL: ONLY IDENTIFY DATA COLUMNS AS VARIABLES
 
-R: ONLY columns that are part of dataframes/datasets
-✓ data$new_column <- data$old_column * 2
-✓ mutate(new_var = old_var + 1)
-no constant_value <- 0.05
+    R: ONLY columns that are part of dataframes/datasets
+    ✓ data$new_column <- data$old_column * 2
+    ✓ mutate(new_var = old_var + 1)
+    no constant_value <- 0.05
 
-Python: ONLY columns that are part of pandas DataFrames
-✓ df['new_column'] = df['old_column'] * 2
-✓ df.assign(new_var = df.old_var + 1)
-no interest_rate = 0.05
+    Python: ONLY columns that are part of pandas DataFrames
+    ✓ df['new_column'] = df['old_column'] * 2
+    ✓ df.assign(new_var = df.old_var + 1)
+    no interest_rate = 0.05
 
-SAS: ONLY variables in DATA steps that are dataset columns
-✓ new_var = existing_var * 0.1; (in data steps)
-✓ PROC SQL: SELECT new_var = old_var * 2
-no %let macro_var = 2023;
+    SAS: ONLY variables in DATA steps that are dataset columns
+    ✓ new_var = existing_var * 0.1; (in data steps)
+    ✓ PROC SQL: SELECT new_var = old_var * 2
+    no %let macro_var = 2023;
 
-IGNORE THESE COMPLETELY:
-- Constants/literals (numbers, strings)
-- Macro variables (%let, %global)
-- File paths and filenames
-- Loop counters (i, j, k)
-- Configuration variables
-- Function parameters
-- Temporary calculations not assigned to datasets
+    IGNORE THESE COMPLETELY:
+    - Constants/literals (numbers, strings)
+    - Macro variables (%let, %global)
+    - File paths and filenames
+    - Loop counters (i, j, k)
+    - Configuration variables
+    - Function parameters
+    - Temporary calculations not assigned to datasets
 
+    STRICTLY RESPOND WITH ONLY THIS JSON:
+    {{
+    "input_variables": ["var1", "var2"],
+    "created_variables": ["var3", "var4"], 
+    "intermediate_variables": ["var5", "var6"]
+    }}"""
 
-STRICTLY RESPOND WITH ONLY THIS JSON:
-
-{{
-  "input_variables": ["var1", "var2"],
-  "created_variables": ["var3", "var4"], 
-  "intermediate_variables": ["var5", "var6"]
-}}
-
-CATEGORIES:
-- INPUT: Variables/Columns assumed to be present in the data that are already EXISTING
-- CREATED: New variables created through calculations/assignments 
-- INTERMEDIATE: Variables modified/transformed from EXISTING/INPUT ones
-CRITICAL - DO NOT MISS ANY VARIABLES FROM List in batch
-
-JSON RESPONSE:"""
-            
             try:
                 response = self.send_message(prompt, {
                     "type": "batch_variable_discovery",
@@ -223,59 +217,124 @@ JSON RESPONSE:"""
                     "max_tokens": 60000,
                     "batch_id": batch_id
                 })
-                
                 if response:
                     return self._parse_ai_variable_response(response, batch_id)
                 else:
                     st.warning(f"⚠️ No AI response for batch {batch_id}")
                     return {'input_variables': [], 'created_variables': [], 'intermediate_variables': []}
-                    
             except Exception as e:
                 st.warning(f"⚠️ AI error for batch {batch_id}: {str(e)}")
                 return {'input_variables': [], 'created_variables': [], 'intermediate_variables': []}
-        
-        # Execute parallel processing
+
+        # (1.3.2) executor loop unchanged
         status_text.text("🚀 Processing batches in parallel...")
-        
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=3) as executor:
-            # Submit all batch jobs
             future_to_batch = {
                 executor.submit(process_single_batch, batch): batch['batch_id'] 
                 for batch in self.code_batches
-            }
-            
+                }
             completed_batches = 0
-            
-            # Collect results as they complete
             for future in as_completed(future_to_batch):
                 try:
                     batch_results = future.result()
-                    
-                    # Merge results
                     for category in ['input_variables', 'created_variables', 'intermediate_variables']:
-                        all_variables[category].extend(batch_results.get(category, []))
-                    
-                    # Update progress
+                        all_ai[category].extend(batch_results.get(category, []))
                     completed_batches += 1
-                    progress = completed_batches / len(self.code_batches)
-                    progress_bar.progress(progress)
+                    progress_bar.progress(completed_batches / len(self.code_batches))
                     status_text.text(f"Completed {completed_batches}/{len(self.code_batches)} batches")
-                    
                 except Exception as e:
                     st.error(f"Error in batch processing: {str(e)}")
-        
-        # Remove duplicates and create all_variables list
-        for category in ['input_variables', 'created_variables', 'intermediate_variables']:
-            all_variables[category] = list(set(all_variables[category]))
-            all_variables['all_variables'].extend(all_variables[category])
-        
-        all_variables['all_variables'] = list(set(all_variables['all_variables']))
-        
+
         progress_bar.empty()
         status_text.empty()
-        
-        return all_variables
-    
+
+        # (1.4) NEW: deterministic, language-aware post-pass (inline, no new method)
+        st.write("🧭 **Normalising variables (deterministic & language-aware)...**")
+
+        # 1.4.a guard: identifiers only; ban dataset names
+        ident = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+        def clean_set(vals):
+            out = []
+            for v in set(vals):
+                v = str(v).strip()
+                if not ident.match(v):
+                    continue
+                if v in ds_ban:
+                    continue
+                out.append(v)
+            return set(out)
+
+        input_vars = clean_set(all_ai['input_variables'])
+        created_vars = clean_set(all_ai['created_variables'])
+        interm_vars = clean_set(all_ai['intermediate_variables'])
+
+        # 1.4.b detect “parameters” by language cues in compiled code (kept minimal)
+        params = set()
+        # SAS macros
+        for m in re.finditer(r'%let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=', self.compiled_code, flags=re.IGNORECASE):
+            params.add(m.group(1))
+        for m in re.finditer(r'%global\s+([A-Za-z_][A-Za-z0-9_]*)', self.compiled_code, flags=re.IGNORECASE):
+            params.add(m.group(1))
+        # Python simple scalars (not DataFrame column assign)
+        for m in re.finditer(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^\n]+)$', self.compiled_code, flags=re.MULTILINE):
+            name, rhs = m.group(1), m.group(2)
+            if '[' in name and ']' in name:
+                continue  # likely df[...] assignment handled elsewhere
+            if re.search(r"read_csv|read_excel|assign|\[[\'\"][A-Za-z_]", rhs):
+                continue
+            if name not in created_vars and name not in interm_vars:
+                params.add(name)
+
+        # Remove parameters from public sets
+        input_vars -= params
+        created_vars -= params
+        interm_vars -= params
+
+        # 1.4.c SAS/Python loop families: group foo_1..N → foo_*
+        families = {}
+        def register_family(name: str):
+            m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)_(\d+|i)$', name)
+            if m:
+                fam = f"{m.group(1)}_*"
+                families.setdefault(fam, set()).add(name)
+
+        for v in list(created_vars) + list(interm_vars):
+            register_family(v)
+
+        # Replace members with fam label (keep metadata compact)
+        for fam, members in families.items():
+            members = set(members)
+            if members & created_vars:
+                created_vars = (created_vars - members) | {fam}
+            if members & interm_vars:
+                interm_vars  = (interm_vars  - members) | {fam}
+
+        all_vars = sorted(input_vars | created_vars | interm_vars, key=str.lower)
+
+        # (1.5) Cache for later deterministic overrides in lineage details
+        self._dl_static_categories = {
+            "inputs": sorted(input_vars, key=str.lower),
+            "created": sorted(created_vars, key=str.lower),
+            "intermediate": sorted(interm_vars, key=str.lower),
+            "parameters": sorted(params, key=str.lower),
+            "families": {k: sorted(v) for k, v in families.items()}
+        }
+        # Also cache datasets from the pre-pass
+        self._dl_datasets = {
+            "input": sorted(pre_input_ds),
+            "output": sorted(pre_output_ds)
+        }
+
+        # Return same structure you already use, extended with parameters/families (non-breaking)
+        return {
+            'input_variables': self._dl_static_categories["inputs"],
+            'created_variables': self._dl_static_categories["created"],
+            'intermediate_variables': self._dl_static_categories["intermediate"],
+            'all_variables': all_vars,
+            'parameters': self._dl_static_categories["parameters"],
+            'families': self._dl_static_categories["families"]
+        }
     def _parse_ai_variable_response(self, response: str, batch_id: int) -> Dict[str, List[str]]:
         """Parse AI response for variables - robust JSON parsing."""
         
@@ -486,6 +545,7 @@ JSON RESPONSE:"""
             for future in as_completed(future_to_batch):
                 try:
                     batch_results = future.result()
+                    
                     detailed_lineage.update(batch_results)
                     
                     completed_batches += 1
@@ -571,7 +631,19 @@ JSON RESPONSE:"""
             detailed_lineage = self.generate_detailed_variable_lineage(
                 code_files, all_discovered_vars, all_variables
             )
-            
+            # NOTE CHANGE2 : POINT3 "sometimes it is adding datasets to variable.""
+            ident = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+            input_ds, output_ds = self._ai_extract_datasets(code_files)
+            banned = set(input_ds) | set(output_ds)
+
+            cleaned = {}
+            for v, info in detailed_lineage.items():
+                if not ident.match(v):
+                    continue
+                if v in banned:
+                    continue
+                cleaned[v] = info
+            detailed_lineage = cleaned
             # Step 2: Convert to table format
             lineage_table = []
             for sr_no, (variable, info) in enumerate(detailed_lineage.items(), 1):
@@ -685,6 +757,21 @@ JSON RESPONSE:"""
         
         st.info(f"📊 Found {len(input_datasets)} input datasets, {len(output_datasets)} output datasets")
         
+        def _dedupe_keep(s):
+            seen, out = set(), []
+            for n in s:
+                n = str(n).strip()
+                if not n or n.lower() in ['set', 'data', 'from', 'to', 'read', 'write', 'input', 'output']:
+                    continue
+                if n not in seen:
+                    out.append(n)
+                    seen.add(n)
+            return out
+
+        input_datasets  = _dedupe_keep(input_datasets)
+        output_datasets = _dedupe_keep(output_datasets)
+
+        st.info(f"📊 Found {len(input_datasets)} input datasets, {len(output_datasets)} output datasets")
         return input_datasets, output_datasets
 
     def _simple_parse_ai_response(self, response: str) -> Tuple[List[str], List[str]]:
@@ -1990,7 +2077,3 @@ class DataLineageVisualizer:
     def create_interactive_lineage_visualization(self, lineage_data):
         """Main interface method - creates overview by default."""
         return self.create_visualization_with_modes(lineage_data, 'overview')
-
-
-
-
