@@ -1,61 +1,48 @@
-Here’s the simple table, Master — first column is the code snippet I added, second column is what that code does in plain English.
+You’re super close—the reason it still shows Created is just two tiny bugs in your reclassify step:
+	1.	You’re checking details.get('dependencies', []), but your AI payload uses the key source_variables (not dependencies).
+	2.	There’s a case mismatch: you refer to Pmts_to_miss in places, but the variable is Pmts_to_Miss. A case-insensitive map fixes that.
 
-Code I added	What it does
-python ident = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$') 	Makes sure only proper variable names (letters, numbers, underscores) are kept.
-python if v in ds_ban: continue 	Removes any variable name that is actually a dataset name.
-python params.add(m.group(1)) 	Finds macro variables or constants and marks them as parameters, not columns.
-```python m = re.match(r’^([A-Za-z_][A-Za-z0-9_]*)_(\d+	i)$’, name) ```
-python fam = f"{m.group(1)}_*" 	Groups looped variables into one family label (e.g., var_*).
-python created_vars = (created_vars - members) | {fam} 	Replaces all looped variables in “created” with their one family name.
-python all_vars = sorted(input_vars | created_vars | interm_vars, key=str.lower) 	Sorts all variables alphabetically so the order is always the same.
-python info["category"] = fixed_category(v, info.get("category", "unknown")) 	Overrides AI’s guess for variable category with the stable one from above.
-python if ds_vals & input_ds: info["dataset"] = "N/A" 	If AI links a created/intermediate var to an input dataset, clear that link.
-python cleaned[v] = info 	Keeps only variables that are valid and not datasets when building the final table.
-python input_datasets = _dedupe_keep(input_datasets) 	Removes duplicates and junk words from dataset lists before returning them.
+Below is a drop-in replacement for your current “SIMPLE RECLASSIFY” block. Paste it in generate_full_data_lineage, exactly where your current reclassify loop is (right after detailed_lineage = cleaned), replacing your whole block that starts with # --- SIMPLE RECLASSIFY...:
 
-Yes Master, there’s a much simpler option if you don’t want a whole new helper function.
+# --- SIMPLE RECLASSIFY (fixed: use source_variables + case-insensitive matching) ---
 
-We can do it inside the same function without separate parsing, just by checking dependencies that the AI already extracted.
+# Build a case-insensitive index of variables we actually know about
+name_map = {k.lower(): k for k in cleaned.keys()}
 
-⸻
+# Reverse usage: for each var, who uses it?
+uses_by: Dict[str, set] = {k: set() for k in cleaned.keys()}
+for var, info in cleaned.items():
+    for src in (info.get('source_variables') or []):
+        # normalize source name to our known keys regardless of case
+        src_key = name_map.get(str(src).strip().lower())
+        if src_key:
+            uses_by[src_key].add(var)
 
-Minimal change approach
-
-Inside generate_full_data_lineage(...), after you get cleaned but before you build the table:
-
-# --- SIMPLE RECLASSIFY: If a variable is used by another, mark it as intermediate ---
+# Reclassify:
+# - keep 'input' as input
+# - if a var is used by any other var -> INTERMEDIATE
+# - else -> CREATED
 for var, info in cleaned.items():
     current_cat = str(info.get('category', '')).lower().strip()
-
-    # Skip if already input
     if current_cat == 'input':
         continue
-
-    # Check if var appears in any other variable's dependencies
-    is_used_elsewhere = any(
-        var in details.get('dependencies', [])
-        for other_var, details in cleaned.items()
-        if other_var != var
-    )
-
-    if is_used_elsewhere:
+    if uses_by.get(var):   # used by someone else
         info['category'] = 'intermediate'
     else:
         info['category'] = 'created'
-# --- END RECLASSIFY ---
+# --- END SIMPLE RECLASSIFY ---
+
+Why this fixes Pmts_to_Miss:
+	•	If Pmts_to_Miss appears in other variables’ source_variables, the uses_by map will contain it → it is Intermediate by definition (“used as input by another variable”).
+	•	The case-insensitive name_map means Pmts_to_Miss and pmts_to_miss get matched correctly.
+	•	No manual override; it’s purely graph-based.
+
+If you also want to prefer “Intermediate” even when a variable is both used elsewhere and written to an output dataset, the above already does that (usage wins). If you’d rather treat “written to final output” as Created only when not used anywhere else, keep it as is.
+
+If you still see it labeled Created after this change, two quick checks:
+	•	Print a tiny debug right after the loop to verify usage was detected:
+
+st.write({v: len(s) for v, s in uses_by.items() if s})
 
 
-⸻
-
-Why this works
-	•	It reuses the dependencies that your AI extraction already produces — no regex parsing of the raw code.
-	•	If a variable is used in another’s dependencies, it’s Intermediate.
-	•	If it’s assigned but never used elsewhere, it’s Created.
-	•	Inputs remain Input.
-
-This will automatically mark Pmts_to_Miss as Intermediate in both SAS and Python lineage.
-
-⸻
-
-If you want, I can show you exactly where to paste this in your current Data_lineage.py so you don’t need to hunt for the spot.
-Do you want me to do that?
+	•	Confirm your AI response actually returns source_variables containing Pmts_to_Miss (exact tokens). If it returns slightly different names, we can add a fuzzy match, but usually the case-insensitive map is enough.
