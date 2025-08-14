@@ -13,61 +13,109 @@ python if ds_vals & input_ds: info["dataset"] = "N/A" 	If AI links a created/int
 python cleaned[v] = info 	Keeps only variables that are valid and not datasets when building the final table.
 python input_datasets = _dedupe_keep(input_datasets) 	Removes duplicates and junk words from dataset lists before returning them.
 
-    def _simple_ai_variable_extraction(self, code, variables):
-        # existing AI call + result merging logic...
-        all_ai = {
-            "input_variables": [],
-            "intermediate_variables": [],
-            "created_variables": []
-        }
+    Got it Master,
+I’ll pinpoint the exact place in your current Data_lineage.py so you can paste this without guessing.
 
-        # ============================================
-        # AI extraction per batch (existing code)
-        # ============================================
-        futures = []
-        for chunk in self._split_code_for_batches(code):
-            futures.append(self.executor.submit(self._ask_ai_lineage, chunk, variables))
+⸻
 
-        for future in futures:
-            batch_results = future.result()
-            for k in all_ai.keys():
-                all_ai[k].extend(batch_results.get(k, []))
+Exact paste location
 
-        # ============================================
-        # --- NEW: detect Python DataFrame column usages ---
-        # This catches usage-only inputs like RemainingTerm
-        # ============================================
-        import re
-        py_col_square = re.findall(
-            r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\]",
-            code
-        )
-        py_col_dot = re.findall(
-            r"\b([A-Za-z_][A-Za-z0-9_]*)\.(?!read_csv|read_excel|to_csv|to_excel|assign|merge|join|groupby|apply|loc|iloc|values|shape|columns)([A-Za-z_][A-Za-z0-9_]*)\b",
-            code
-        )
+You told me your Data_lineage.py already has this rough flow inside _simple_ai_variable_extraction:
 
-        # Only keep likely DataFrame objects
-        _df_like = {
-            n for n, _ in py_col_square + py_col_dot
-            if re.match(r"^(df|data|tbl|tmp|dftmp|results)\w*$", n, re.IGNORECASE)
-        }
+def _simple_ai_variable_extraction(self, code, variables):
+    all_ai = {
+        "input_variables": [],
+        "intermediate_variables": [],
+        "created_variables": []
+    }
 
-        usage_only_inputs = set()
-        for n, col in py_col_square:
-            if n in _df_like:
-                usage_only_inputs.add(col)
-        for n, col in py_col_dot:
-            if n in _df_like:
-                usage_only_inputs.add(col)
+    futures = []
+    for chunk in self._split_code_for_batches(code):
+        futures.append(self.executor.submit(self._ask_ai_lineage, chunk, variables))
 
-        # Merge detected usage-only inputs into AI's list
-        all_ai["input_variables"].extend(sorted(usage_only_inputs))
-        # ============================================
-        # --- END NEW ---
-        # ============================================
+    for future in futures:
+        batch_results = future.result()
+        for k in all_ai.keys():
+            all_ai[k].extend(batch_results.get(k, []))
 
-        # deterministic clean + family grouping (your existing Patch B/C logic)
-        all_ai = self._clean_ai_results(all_ai)
+    # <<< PLACE NEW CODE HERE >>>
 
-        return all_ai
+    # deterministic clean + family grouping
+    all_ai = self._clean_ai_results(all_ai)
+
+    return all_ai
+
+
+⸻
+
+Your full function with the fix included
+
+def _simple_ai_variable_extraction(self, code, variables):
+    all_ai = {
+        "input_variables": [],
+        "intermediate_variables": [],
+        "created_variables": []
+    }
+
+    # === 1. Run AI extraction in parallel batches ===
+    futures = []
+    for chunk in self._split_code_for_batches(code):
+        futures.append(self.executor.submit(self._ask_ai_lineage, chunk, variables))
+
+    for future in futures:
+        batch_results = future.result()
+        for k in all_ai.keys():
+            all_ai[k].extend(batch_results.get(k, []))
+
+    # === 2. NEW: detect Python DataFrame column usages (usage-only inputs like RemainingTerm) ===
+    import re
+    py_col_square = re.findall(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\]",
+        code
+    )
+    py_col_dot = re.findall(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\.(?!read_csv|read_excel|to_csv|to_excel|assign|merge|join|groupby|apply|loc|iloc|values|shape|columns)([A-Za-z_][A-Za-z0-9_]*)\b",
+        code
+    )
+
+    # Identify likely DataFrame-like objects
+    _df_like = {
+        n for n, _ in py_col_square + py_col_dot
+        if re.match(r"^(df|data|tbl|tmp|dftmp|results)\w*$", n, re.IGNORECASE)
+    }
+
+    usage_only_inputs = set()
+    for n, col in py_col_square:
+        if n in _df_like:
+            usage_only_inputs.add(col)
+    for n, col in py_col_dot:
+        if n in _df_like:
+            usage_only_inputs.add(col)
+
+    # Merge into input variables list
+    all_ai["input_variables"].extend(sorted(usage_only_inputs))
+    # === END NEW ===
+
+    # === 3. Deterministic cleanup and family grouping ===
+    all_ai = self._clean_ai_results(all_ai)
+
+    return all_ai
+
+
+⸻
+
+📌 Paste point
+	•	Find the last line of your AI merging loop:
+
+for future in futures:
+    ...
+    all_ai[k].extend(batch_results.get(k, []))
+
+
+	•	Immediately after that loop, paste my NEW block.
+	•	Do not put it after _clean_ai_results(), because then it will be too late to get RemainingTerm classified correctly.
+
+⸻
+
+If you want, Master, I can also adjust _clean_ai_results so that these new usage-only inputs are deduplicated and never overwritten by AI’s intermediate/created guesses. That would make the detection 100% stable across SAS and Python.
+Do you want me to add that safeguard too?
