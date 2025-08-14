@@ -13,109 +13,71 @@ python if ds_vals & input_ds: info["dataset"] = "N/A" 	If AI links a created/int
 python cleaned[v] = info 	Keeps only variables that are valid and not datasets when building the final table.
 python input_datasets = _dedupe_keep(input_datasets) 	Removes duplicates and junk words from dataset lists before returning them.
 
-    Got it Master,
-I’ll pinpoint the exact place in your current Data_lineage.py so you can paste this without guessing.
+       You’re right—let’s make this surgical and precise.
 
-⸻
+Where to paste
 
-Exact paste location
+In your DataLineageAnalyzer._simple_ai_variable_extraction method, paste the block right after:
 
-You told me your Data_lineage.py already has this rough flow inside _simple_ai_variable_extraction:
+progress_bar.empty()
+status_text.empty()
 
-def _simple_ai_variable_extraction(self, code, variables):
-    all_ai = {
-        "input_variables": [],
-        "intermediate_variables": [],
-        "created_variables": []
-    }
+and just before:
 
-    futures = []
-    for chunk in self._split_code_for_batches(code):
-        futures.append(self.executor.submit(self._ask_ai_lineage, chunk, variables))
+st.write("🧭 **Normalising variables (deterministic & language-aware)...**")
 
-    for future in futures:
-        batch_results = future.result()
-        for k in all_ai.keys():
-            all_ai[k].extend(batch_results.get(k, []))
+Paste this exact block
 
-    # <<< PLACE NEW CODE HERE >>>
+        # === PATCH: usage-only input detection (Python; catches RemainingTerm, etc.) ===
+        # If a column is only ever READ (df['col'] / df.col) and never ASSIGNED on LHS,
+        # treat it as an INPUT variable even if the AI missed it.
 
-    # deterministic clean + family grouping
-    all_ai = self._clean_ai_results(all_ai)
+        # 1) Find Python DataFrame column *reads*
+        py_reads_sq = re.findall(
+            r"\b([A-Za-z_]\w*)\s*\[\s*['\"]([A-Za-z_]\w*)['\"]\s*\]",
+            self.compiled_code
+        )
+        py_reads_dot = re.findall(
+            r"\b([A-Za-z_]\w*)\.(?!read_csv|read_excel|to_csv|to_excel|assign|merge|join|groupby|apply|loc|iloc|values|shape|columns)([A-Za-z_]\w*)\b",
+            self.compiled_code
+        )
 
-    return all_ai
+        # 2) Heuristic: DF-like object names
+        df_like_names = {
+            n for n, _ in (py_reads_sq + py_reads_dot)
+            if re.match(r"^(df|data|tbl|tmp|dftmp|result|results)\w*$", n, flags=re.IGNORECASE)
+        }
 
+        usage_read_cols = set()
+        for n, c in py_reads_sq:
+            if n in df_like_names:
+                usage_read_cols.add(c)
+        for n, c in py_reads_dot:
+            if n in df_like_names:
+                usage_read_cols.add(c)
 
-⸻
+        # 3) Find Python DataFrame column *assignments* (LHS)
+        lhs_assign_sq = re.findall(
+            r"\b[A-Za-z_]\w*\s*\[\s*['\"]([A-Za-z_]\w*)['\"]\s*\]\s*=",
+            self.compiled_code
+        )
+        lhs_assign_dot = re.findall(
+            r"\b[A-Za-z_]\w*\.([A-Za-z_]\w*)\s*=",
+            self.compiled_code
+        )
+        lhs_assign_via_assign = re.findall(
+            r"\.assign\s*\(\s*([A-Za-z_]\w*)\s*=",
+            self.compiled_code
+        )
 
-Your full function with the fix included
+        assigned_cols = set(lhs_assign_sq) | set(lhs_assign_dot) | set(lhs_assign_via_assign)
 
-def _simple_ai_variable_extraction(self, code, variables):
-    all_ai = {
-        "input_variables": [],
-        "intermediate_variables": [],
-        "created_variables": []
-    }
+        # 4) “Pure usage” columns = read but never assigned → definitely inputs
+        pure_usage_inputs = sorted(usage_read_cols - assigned_cols)
 
-    # === 1. Run AI extraction in parallel batches ===
-    futures = []
-    for chunk in self._split_code_for_batches(code):
-        futures.append(self.executor.submit(self._ask_ai_lineage, chunk, variables))
+        # 5) Merge into AI result before normalization
+        all_ai['input_variables'].extend(pure_usage_inputs)
+        # === END PATCH ===
 
-    for future in futures:
-        batch_results = future.result()
-        for k in all_ai.keys():
-            all_ai[k].extend(batch_results.get(k, []))
-
-    # === 2. NEW: detect Python DataFrame column usages (usage-only inputs like RemainingTerm) ===
-    import re
-    py_col_square = re.findall(
-        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\]",
-        code
-    )
-    py_col_dot = re.findall(
-        r"\b([A-Za-z_][A-Za-z0-9_]*)\.(?!read_csv|read_excel|to_csv|to_excel|assign|merge|join|groupby|apply|loc|iloc|values|shape|columns)([A-Za-z_][A-Za-z0-9_]*)\b",
-        code
-    )
-
-    # Identify likely DataFrame-like objects
-    _df_like = {
-        n for n, _ in py_col_square + py_col_dot
-        if re.match(r"^(df|data|tbl|tmp|dftmp|results)\w*$", n, re.IGNORECASE)
-    }
-
-    usage_only_inputs = set()
-    for n, col in py_col_square:
-        if n in _df_like:
-            usage_only_inputs.add(col)
-    for n, col in py_col_dot:
-        if n in _df_like:
-            usage_only_inputs.add(col)
-
-    # Merge into input variables list
-    all_ai["input_variables"].extend(sorted(usage_only_inputs))
-    # === END NEW ===
-
-    # === 3. Deterministic cleanup and family grouping ===
-    all_ai = self._clean_ai_results(all_ai)
-
-    return all_ai
-
-
-⸻
-
-📌 Paste point
-	•	Find the last line of your AI merging loop:
-
-for future in futures:
-    ...
-    all_ai[k].extend(batch_results.get(k, []))
-
-
-	•	Immediately after that loop, paste my NEW block.
-	•	Do not put it after _clean_ai_results(), because then it will be too late to get RemainingTerm classified correctly.
-
-⸻
-
-If you want, Master, I can also adjust _clean_ai_results so that these new usage-only inputs are deduplicated and never overwritten by AI’s intermediate/created guesses. That would make the detection 100% stable across SAS and Python.
-Do you want me to add that safeguard too?
+That’s it.
+This makes RemainingTerm (and similar columns that are used but never assigned) show up as Input consistently, without touching your downstream logic.
