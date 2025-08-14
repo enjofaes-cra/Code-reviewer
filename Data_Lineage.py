@@ -134,8 +134,8 @@ class DataLineageAnalyzer(AVAAssistant):
         # NOTE CHANGE1 : POINT1 "1) running the same code give same inputs and outupts, but created vs intermediate is changing --> therefore network changing:: context to be refined here. 
         # example notice_of_default_fee"
         """AI-powered variable extraction with a deterministic, language-aware post-pass.
-        Keeps your parallel AI discovery intact, then normalises:
-        - bans dataset-like tokens from variable lists,
+        Parallel AI discovery + normalisation of variables:
+        - bans dataset types from variable lists,
         - separates parameters/macros/scalars from real columns,
         - groups SAS loop families (e.g., foo_1..N → foo_*),
         - sorts for stable output so Created/Intermediate don’t flip between runs.
@@ -146,7 +146,7 @@ class DataLineageAnalyzer(AVAAssistant):
         st.write("🔧 **Extracting functions and macros...**")
         self._extract_functions_and_macros()
 
-        # (1.2) NEW: pre-extract datasets once to help cleaning (still using your method)
+        # (1.2) NEW: pre-extract datasets once to help cleaning 
         st.write("📦 **Pre-extracting datasets (to stabilise variable cleaning)...**")
         pre_input_ds, pre_output_ds = self._ai_extract_datasets(code_files)
         ds_ban = set(pre_input_ds) | set(pre_output_ds)
@@ -156,7 +156,7 @@ class DataLineageAnalyzer(AVAAssistant):
         progress_bar = st.progress(0)
         status_text = st.empty()
 
-        all_ai = {
+        all_variables = {
             'input_variables': [],
             'created_variables': [],
             'intermediate_variables': [],
@@ -208,7 +208,14 @@ class DataLineageAnalyzer(AVAAssistant):
     "input_variables": ["var1", "var2"],
     "created_variables": ["var3", "var4"], 
     "intermediate_variables": ["var5", "var6"]
-    }}"""
+    }}
+CATEGORIES:
+- INPUT: Variables/Columns that are present in the original input datasets (before new variables are added)
+- INTERMEDIATE: Variables modified or transformed from existing INPUT variables, and that are used as inputs for other variables
+- CREATED: New variables created through calculations/assignments using either INPUT or INTERMEDIATE variables, but that are not used as inputs for any other variable
+CRITICAL - DO NOT MISS ANY VARIABLES FROM List in batch
+
+JSON RESPONSE:"""
 
             try:
                 response = self.send_message(prompt, {
@@ -226,9 +233,9 @@ class DataLineageAnalyzer(AVAAssistant):
                 st.warning(f"⚠️ AI error for batch {batch_id}: {str(e)}")
                 return {'input_variables': [], 'created_variables': [], 'intermediate_variables': []}
 
-        # (1.3.2) executor loop unchanged
+        # (1.3.2) executor loop 
         status_text.text("🚀 Processing batches in parallel...")
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         with ThreadPoolExecutor(max_workers=3) as executor:
             future_to_batch = {
                 executor.submit(process_single_batch, batch): batch['batch_id'] 
@@ -239,17 +246,66 @@ class DataLineageAnalyzer(AVAAssistant):
                 try:
                     batch_results = future.result()
                     for category in ['input_variables', 'created_variables', 'intermediate_variables']:
-                        all_ai[category].extend(batch_results.get(category, []))
+                        all_variables[category].extend(batch_results.get(category, []))
                     completed_batches += 1
-                    progress_bar.progress(completed_batches / len(self.code_batches))
+                    progress = completed_batches / len(self.code_batches)
+                    progress_bar.progress(progress)
                     status_text.text(f"Completed {completed_batches}/{len(self.code_batches)} batches")
                 except Exception as e:
                     st.error(f"Error in batch processing: {str(e)}")
 
         progress_bar.empty()
         status_text.empty()
+        # === PATCH: usage-only input detection (Python; catches RemainingTerm, etc.) ===
+        # If a column is only ever READ (df['col'] / df.col) and never ASSIGNED on LHS,
+        # treat it as an INPUT variable even if the AI missed it.
 
-        # (1.4) NEW: deterministic, language-aware post-pass (inline, no new method)
+        # 1) Find Python DataFrame column *reads*
+        py_reads_sq = re.findall(
+            r"\b([A-Za-z_]\w*)\s*\[\s*['\"]([A-Za-z_]\w*)['\"]\s*\]",
+            self.compiled_code
+        )
+        py_reads_dot = re.findall(
+            r"\b([A-Za-z_]\w*)\.(?!read_csv|read_excel|to_csv|to_excel|assign|merge|join|groupby|apply|loc|iloc|values|shape|columns)([A-Za-z_]\w*)\b",
+            self.compiled_code
+        )
+
+        # 2) Heuristic: DF-like object names
+        df_like_names = {
+            n for n, _ in (py_reads_sq + py_reads_dot)
+            if re.match(r"^(df|data|tbl|tmp|dftmp|result|results)\w*$", n, flags=re.IGNORECASE)
+        }
+
+        usage_read_cols = set()
+        for n, c in py_reads_sq:
+            if n in df_like_names:
+                usage_read_cols.add(c)
+        for n, c in py_reads_dot:
+            if n in df_like_names:
+                usage_read_cols.add(c)
+
+        # 3) Find Python DataFrame column *assignments* (LHS)
+        lhs_assign_sq = re.findall(
+            r"\b[A-Za-z_]\w*\s*\[\s*['\"]([A-Za-z_]\w*)['\"]\s*\]\s*=",
+            self.compiled_code
+        )
+        lhs_assign_dot = re.findall(
+            r"\b[A-Za-z_]\w*\.([A-Za-z_]\w*)\s*=",
+            self.compiled_code
+        )
+        lhs_assign_via_assign = re.findall(
+            r"\.assign\s*\(\s*([A-Za-z_]\w*)\s*=",
+            self.compiled_code
+        )
+
+        assigned_cols = set(lhs_assign_sq) | set(lhs_assign_dot) | set(lhs_assign_via_assign)
+
+        # 4) “Pure usage” columns = read but never assigned → definitely inputs
+        pure_usage_inputs = sorted(usage_read_cols - assigned_cols)
+
+        # 5) Merge into AI result before normalization
+        all_variables['input_variables'].extend(pure_usage_inputs)
+        # NOTE CHANGE3: (1.4) deterministic, language-aware post-pass 
         st.write("🧭 **Normalising variables (deterministic & language-aware)...**")
 
         # 1.4.a guard: identifiers only; ban dataset names
@@ -265,9 +321,9 @@ class DataLineageAnalyzer(AVAAssistant):
                 out.append(v)
             return set(out)
 
-        input_vars = clean_set(all_ai['input_variables'])
-        created_vars = clean_set(all_ai['created_variables'])
-        interm_vars = clean_set(all_ai['intermediate_variables'])
+        input_vars = clean_set(all_variables['input_variables'])
+        created_vars = clean_set(all_variables['created_variables'])
+        interm_vars = clean_set(all_variables['intermediate_variables'])
 
         # 1.4.b detect “parameters” by language cues in compiled code (kept minimal)
         params = set()
@@ -280,7 +336,7 @@ class DataLineageAnalyzer(AVAAssistant):
         for m in re.finditer(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^\n]+)$', self.compiled_code, flags=re.MULTILINE):
             name, rhs = m.group(1), m.group(2)
             if '[' in name and ']' in name:
-                continue  # likely df[...] assignment handled elsewhere
+                continue  # df[...] assignment handled elsewhere
             if re.search(r"read_csv|read_excel|assign|\[[\'\"][A-Za-z_]", rhs):
                 continue
             if name not in created_vars and name not in interm_vars:
@@ -436,7 +492,7 @@ class DataLineageAnalyzer(AVAAssistant):
 
             detailed_lineage = {}
             
-            for variable in selected_variables:
+            for variable in variables:
                 st.write(f"🔍 Analyzing {variable}...")
                 
                 # Search for variable assignment lines
@@ -464,55 +520,90 @@ class DataLineageAnalyzer(AVAAssistant):
                 else:
                     specific_code = all_code
             
-            lineage_prompt = f"""ANALYZE LINEAGE FOR ALL OF THESE VARIABLES. RESPOND ONLY WITH JSON.
+            lineage_prompt = f"""
+            You are a precise data-lineage engine. Your task is to return JSON with detailed variable lineage information.
 
-VARIABLES TO ANALYZE: {variables_str}
-    CODE:
-    {all_code}
+            Target variables:
+            {variables_str}
 
-FOR EACH VARIABLE, PROVIDE DETAILED LINEAGE. DO NOT MISS ANY VARIABLE.
-RESPOND WITH ONLY THIS JSON:
+            Code:
+            {all_code}
 
-{{
-  "lineage_results": [
-    {{
-      "variable": "variable_name",
-      "category": "input|created|intermediate",
-      "source_variables": ["source_var1", "source_var2"], 
-      "dataset": ["dataset1"],
-      "calculation": "exact_formula_or_logic",
-      "description": "business_explanation",
-      "business_purpose": "why_this_variable_exists",
-      "code_location": "file_and_line_reference",
-      "detailed_steps": ["step1", "step2", "step3"]
-    }}
-  ]
-}}
-
-FIND:
-- Exact and detailed calculation formulas
-- Source variables used
-- Dataset: ASSIGNMENT RULES (CRITICAL - FOLLOW EXACTLY):
-Rule 1: IF variable "category" is "input" → "dataset" field MUST be INPUT dataset name
-- Look for: pd.read_csv, SET dataset, FROM table, IMPORT commands
-- Example: "customer_data.csv", "sales_table", "input_file.xlsx"
-
-Rule 2: IF variable "category" is "created" OR "intermediate" → "dataset" field MUST be OUTPUT dataset name  
-- Look for: to_csv, DATA output, CREATE TABLE, EXPORT commands
-- Example: "results.csv", "output_table", "final_report.xlsx"
-
-Rule 3: IF no clear dataset found → Use "N/A" but NEVER mix input/output categories
-
-Rule 4: There can be a single input/output dataset for a variable
-
-- Business purpose explanation
-- Step-by-step transformation logic
-- If there are source_variables found for the variable being processed, then try to get all the details for all the 
-    source_variables as well along with their exact formulae.
-- Do not miss any of the 3 variable from the list
-
-JSON RESPONSE:"""
+            Definitions that hold for all programming languages :
+            - INPUT: Variables/Columns that are present in the original input datasets (before new variables are added)
+            - INTERMEDIATE: Variables modified or transformed from existing INPUT variables, and that are used as inputs for other variables
+            - CREATED: New variables created through calculations/assignments using either INPUT or INTERMEDIATE variables, but that are not used as inputs for any other variable
             
+            Language-specific rules:
+            SAS:
+            - Treat %let and %global as parameters, not variables.
+            - DATA step assignments create variables in the active dataset.
+            - PROC SQL SELECT expressions create variables in the target table.
+            - Imports (PROC IMPORT / SET / FROM) mark input datasets; exports (PROC EXPORT / DATA final / CREATE TABLE) mark outputs.
+            - Variables dropped later are still variables; looped arrays like var_1, var_2… are intermediate unless kept as final.
+
+            Python:
+            - Treat only DataFrame column operations as variables (df['x'] = ..., df = df.assign(...)).
+            - Scalar assignments (x = 0.05) are parameters, not variables.
+            - Reads (pd.read_csv, pd.read_excel) mark input datasets; writes (to_csv, to_excel) mark outputs.
+            - Columns created and later dropped, especially looped arrays, are intermediate unless explicitly retained in the final output.
+
+            R:
+            - Treat only DataFrame (data.frame, tibble, or data.table) column operations as variables (df$x <- ..., df <- mutate(df, ...)).
+            - Scalar assignments (x <- 0.05) are parameters, not variables.
+            - Reads (read.csv, read_excel, fread) mark input datasets; writes (write.csv, write_excel, fwrite) mark outputs.
+            - Columns created and later dropped, especially looped arrays (e.g., within lapply or for loops), are intermediate unless explicitly retained
+
+            SQL:
+            - Treat only column operations in SELECT, UPDATE, INSERT statements as variables (SELECT col AS ..., UPDATE table SET col = ...).
+            - Scalar assignments (DECLARE @x = 0.05) are parameters, not variables.
+            - Reads (SELECT FROM, JOIN, subqueries) mark input datasets; writes (INSERT INTO, CREATE TABLE, SELECT INTO, EXPORT) mark outputs.
+            - Columns created and later dropped, especially looped/generated columns, are intermediate unless explicitly retained in
+
+            Other languages:
+            - Treat only explicit data structure field/column operations as variables (e.g., obj.field = ..., table['col'] = ...).
+            - Scalar assignments (x = 0.05, let x = 0.05, var x = 0.05) are parameters, not variables.
+            - Reads (file/database imports, API data pulls) mark input datasets; writes (file/database exports, API pushes) mark outputs.
+            - Fields/columns created and later dropped, especially looped/generated ones, are intermediate unless explicitly retained in
+
+            Family pattern for looped variables:
+            - If a variable name matches ^([A-Za-z_][A-Za-z0-9_]*)_(\\d+)$, group the whole set as one "family" (e.g., Average_EAD_*).
+            - Family members share the same category, usually intermediate unless exported.
+
+            Dataset rules:
+            - If category is "input", dataset must be the name of the input dataset.
+            - If category is "created" or "intermediate", dataset is the output dataset name if saved/exported, otherwise "N/A".
+            - Only one dataset name per variable.
+
+            Parameters and constants:
+            - Do not classify parameters, constants, counters (i, j, k), or file paths as variables.
+
+            Output JSON schema (return only JSON):
+            {{
+            "lineage_results": [
+                {{
+                "variable": "variable_name",
+                "category": "input|intermediate|created",
+                "source_variables": ["source1", "source2"],
+                "dataset": ["dataset_name" or "N/A"],
+                "calculation": "exact expression or logic from the code",
+                "description": "plain English explanation",
+                "business_purpose": "why this variable exists",
+                "code_location": "FileName:Line(s) if clear, else 'N/A'",
+                "detailed_steps": ["step 1", "step 2", "step 3"],
+                "family": "base_* if part of a loop family, else 'N/A'"
+                }}
+            ]
+            }}
+
+            Requirements:
+            - Cover every target variable listed above.
+            - Apply the same classification rules for SAS and Python.
+            - Respect dataset naming rules.
+            - Use exact code expressions for "calculation" where possible.
+            - Do not include any non-variables.
+            - Return only valid JSON.
+            """
             try:
                 response = self.send_message(lineage_prompt, {
                     "type": "batch_lineage_analysis",
@@ -545,7 +636,6 @@ JSON RESPONSE:"""
             for future in as_completed(future_to_batch):
                 try:
                     batch_results = future.result()
-                    
                     detailed_lineage.update(batch_results)
                     
                     completed_batches += 1
@@ -644,6 +734,27 @@ JSON RESPONSE:"""
                     continue
                 cleaned[v] = info
             detailed_lineage = cleaned
+            
+            # --- SIMPLE RECLASSIFY: If a variable is used by another, mark it as intermediate ---
+            for var, info in cleaned.items():
+                current_cat = str(info.get('category', '')).lower().strip()
+
+                # Skip if already input
+                if current_cat == 'input':
+                    continue
+
+                # Check if var appears in any other variable's dependencies
+                is_used_elsewhere = any(
+                    var in details.get('dependencies', [])
+                    for other_var, details in cleaned.items()
+                    if other_var != var
+                )
+
+                if is_used_elsewhere:
+                    info['category'] = 'intermediate'
+                else:
+                    info['category'] = 'created'
+            
             # Step 2: Convert to table format
             lineage_table = []
             for sr_no, (variable, info) in enumerate(detailed_lineage.items(), 1):
@@ -2077,3 +2188,7 @@ class DataLineageVisualizer:
     def create_interactive_lineage_visualization(self, lineage_data):
         """Main interface method - creates overview by default."""
         return self.create_visualization_with_modes(lineage_data, 'overview')
+
+
+
+
