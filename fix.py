@@ -13,71 +13,49 @@ python if ds_vals & input_ds: info["dataset"] = "N/A" 	If AI links a created/int
 python cleaned[v] = info 	Keeps only variables that are valid and not datasets when building the final table.
 python input_datasets = _dedupe_keep(input_datasets) 	Removes duplicates and junk words from dataset lists before returning them.
 
-       You’re right—let’s make this surgical and precise.
+Yes Master, there’s a much simpler option if you don’t want a whole new helper function.
 
-Where to paste
+We can do it inside the same function without separate parsing, just by checking dependencies that the AI already extracted.
 
-In your DataLineageAnalyzer._simple_ai_variable_extraction method, paste the block right after:
+⸻
 
-progress_bar.empty()
-status_text.empty()
+Minimal change approach
 
-and just before:
+Inside generate_full_data_lineage(...), after you get cleaned but before you build the table:
 
-st.write("🧭 **Normalising variables (deterministic & language-aware)...**")
+# --- SIMPLE RECLASSIFY: If a variable is used by another, mark it as intermediate ---
+for var, info in cleaned.items():
+    current_cat = str(info.get('category', '')).lower().strip()
 
-Paste this exact block
+    # Skip if already input
+    if current_cat == 'input':
+        continue
 
-        # === PATCH: usage-only input detection (Python; catches RemainingTerm, etc.) ===
-        # If a column is only ever READ (df['col'] / df.col) and never ASSIGNED on LHS,
-        # treat it as an INPUT variable even if the AI missed it.
+    # Check if var appears in any other variable's dependencies
+    is_used_elsewhere = any(
+        var in details.get('dependencies', [])
+        for other_var, details in cleaned.items()
+        if other_var != var
+    )
 
-        # 1) Find Python DataFrame column *reads*
-        py_reads_sq = re.findall(
-            r"\b([A-Za-z_]\w*)\s*\[\s*['\"]([A-Za-z_]\w*)['\"]\s*\]",
-            self.compiled_code
-        )
-        py_reads_dot = re.findall(
-            r"\b([A-Za-z_]\w*)\.(?!read_csv|read_excel|to_csv|to_excel|assign|merge|join|groupby|apply|loc|iloc|values|shape|columns)([A-Za-z_]\w*)\b",
-            self.compiled_code
-        )
+    if is_used_elsewhere:
+        info['category'] = 'intermediate'
+    else:
+        info['category'] = 'created'
+# --- END RECLASSIFY ---
 
-        # 2) Heuristic: DF-like object names
-        df_like_names = {
-            n for n, _ in (py_reads_sq + py_reads_dot)
-            if re.match(r"^(df|data|tbl|tmp|dftmp|result|results)\w*$", n, flags=re.IGNORECASE)
-        }
 
-        usage_read_cols = set()
-        for n, c in py_reads_sq:
-            if n in df_like_names:
-                usage_read_cols.add(c)
-        for n, c in py_reads_dot:
-            if n in df_like_names:
-                usage_read_cols.add(c)
+⸻
 
-        # 3) Find Python DataFrame column *assignments* (LHS)
-        lhs_assign_sq = re.findall(
-            r"\b[A-Za-z_]\w*\s*\[\s*['\"]([A-Za-z_]\w*)['\"]\s*\]\s*=",
-            self.compiled_code
-        )
-        lhs_assign_dot = re.findall(
-            r"\b[A-Za-z_]\w*\.([A-Za-z_]\w*)\s*=",
-            self.compiled_code
-        )
-        lhs_assign_via_assign = re.findall(
-            r"\.assign\s*\(\s*([A-Za-z_]\w*)\s*=",
-            self.compiled_code
-        )
+Why this works
+	•	It reuses the dependencies that your AI extraction already produces — no regex parsing of the raw code.
+	•	If a variable is used in another’s dependencies, it’s Intermediate.
+	•	If it’s assigned but never used elsewhere, it’s Created.
+	•	Inputs remain Input.
 
-        assigned_cols = set(lhs_assign_sq) | set(lhs_assign_dot) | set(lhs_assign_via_assign)
+This will automatically mark Pmts_to_Miss as Intermediate in both SAS and Python lineage.
 
-        # 4) “Pure usage” columns = read but never assigned → definitely inputs
-        pure_usage_inputs = sorted(usage_read_cols - assigned_cols)
+⸻
 
-        # 5) Merge into AI result before normalization
-        all_ai['input_variables'].extend(pure_usage_inputs)
-        # === END PATCH ===
-
-That’s it.
-This makes RemainingTerm (and similar columns that are used but never assigned) show up as Input consistently, without touching your downstream logic.
+If you want, I can show you exactly where to paste this in your current Data_lineage.py so you don’t need to hunt for the spot.
+Do you want me to do that?
